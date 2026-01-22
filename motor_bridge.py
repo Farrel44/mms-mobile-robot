@@ -52,7 +52,7 @@ class MotorBridge(Node):
         self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)
         self.serial_read_timer = self.create_timer(0.02, self.read_feedback_callback)
         
-        self.get_logger().info("🚀 Motor bridge ready")
+        self.get_logger().info("Motor bridge ready")
 
     def _init_serial_connection(self):
         """Sync to ESP32 packet stream, preventing boot message corruption in buffer"""
@@ -126,7 +126,7 @@ class MotorBridge(Node):
             return None
         
         if not self.verify_checksum(packet):
-            self.get_logger().warn("⚠️ Feedback checksum mismatch!")
+            self.get_logger().warn("Feedback checksum mismatch!")
             return None
         
         try:
@@ -175,7 +175,7 @@ class MotorBridge(Node):
     
     def send_stop_command(self):
         self.send_rpm_command(0, 0, 0)
-        self.get_logger().warn("🛑 STOP command sent!")
+        self.get_logger().warn("STOP command sent!")
     
     def read_feedback_callback(self):
         """Read and parse incoming feedback packets from ESP32"""
@@ -230,7 +230,7 @@ class MotorBridge(Node):
         elapsed = time.time() - self.last_cmd_time
         
         if elapsed > self.watchdog_timeout and not self.watchdog_triggered:
-            self.get_logger().warn(f"⚠️ WATCHDOG: No cmd_vel for {elapsed:.2f}s - Stopping motors!")
+            self.get_logger().warn(f"WATCHDOG: No cmd_vel for {elapsed:.2f}s - Stopping motors!")
             self.send_stop_command()
             self.watchdog_triggered = True
 
