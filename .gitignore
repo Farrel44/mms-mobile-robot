@@ -1,0 +1,143 @@
+# ========================================
+# ROS 2 Build Artifacts
+# ========================================
+build/
+install/
+log/
+*.egg-info/
+
+# ========================================
+# Python
+# ========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# ========================================
+# IDEs and Editors
+# ========================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ========================================
+# OS Files
+# ========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ========================================
+# Test and Debug Files
+# ========================================
+*.log
+*.tmp
+*.bak
+*.swp
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+
+# ========================================
+# Project Specific
+# ========================================
+# Temporary test scripts
+test_*.py.backup
+*_backup.py
+
+# Serial port lock files
+*.lock
+
+# Debug output
+/debug_*.txt
+/test_output/
+*.pcap
+
+# Documentation build
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# ========================================
+# ROS Specific
+# ========================================
+# Colcon
+COLCON_IGNORE
+.colcon_install_layout
+
+# Generated messages/services
+*_msgs/
+*_srvs/
+
+# Bag files (large data files)
+*.bag
+*.db3
+*.db3-shm
+*.db3-wal
+
+# ========================================
+# Misc
+# ========================================
+.env
+.envrc
+*.orig
+*.rej

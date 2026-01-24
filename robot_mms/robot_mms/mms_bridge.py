@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+ROS2 node bridging /cmd_vel to ESP32 motor controller via binary serial protocol.
+Implements 500ms watchdog for safety and publishes encoder + IMU feedback.
+"""
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -6,9 +10,8 @@ from std_msgs.msg import Float32MultiArray
 import serial
 import struct
 import time
+import math
 import threading
-
-from .kinematics import cmd_vel_to_rpm
 
 PACKET_HEADER = 0xA5
 CMD_PACKET_SIZE = 8
@@ -26,6 +29,7 @@ class MotorBridge(Node):
         self.last_cmd_time = time.time()
         self.watchdog_triggered = False
             
+        # Thread-safe feedback state shared between serial reader and publishers
         self.encoder_ticks = [0, 0, 0]
         self.gyro_z = 0.0
         self.accel_z = 0.0
@@ -51,23 +55,36 @@ class MotorBridge(Node):
         self.get_logger().info("Motor bridge ready")
 
     def _init_serial_connection(self):
+        """Sync to ESP32 packet stream, preventing boot message corruption in buffer"""
+        self.get_logger().info("Initializing serial connection...")
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
         time.sleep(2.5)
         
+        # Send binary mode command
+        self.get_logger().info("Switching ESP32 to binary mode...")
         self.ser.write(b'b')
-        time.sleep(0.3)
+        time.sleep(0.5)  # Increased delay for mode switch
         
+        # Clear any response/garbage
         if self.ser.in_waiting > 0:
             garbage = self.ser.read(self.ser.in_waiting)
             self.get_logger().info(f"Cleared {len(garbage)} bytes boot data")
         
+        # Additional buffer reset after mode switch
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+        time.sleep(0.2)
+        
+        self.get_logger().info("Binary mode active, syncing to feedback stream...")
         if self._sync_to_header(max_attempts=500):
             self.ser.read(17)
             self.ser.reset_input_buffer()
+            self.get_logger().info("Serial sync complete!")
             self.get_logger().info("Synced to packet stream")
     
     def _sync_to_header(self, max_attempts=100):
+        """Find 0xA5 header without CPU spinning on empty buffer"""
         for _ in range(max_attempts):
             if self.ser.in_waiting > 0:
                 byte = self.ser.read(1)
@@ -90,8 +107,13 @@ class MotorBridge(Node):
         received_checksum = packet[-1]
         calculated = self.calculate_checksum(data)
         return calculated == received_checksum
+
+    def velocity_to_rpm(self, wheel_velocity):
+        rpm = (wheel_velocity * 60.0) / (2.0 * math.pi * self.wheel_radius)
+        return rpm
     
     def build_command_packet(self, rpm1, rpm2, rpm3):
+        """Build 8-byte command: [0xA5, RPM1(2), RPM2(2), RPM3(2), XOR]"""
         rpm1 = int(max(min(rpm1, self.max_rpm), -self.max_rpm))
         rpm2 = int(max(min(rpm2, self.max_rpm), -self.max_rpm))
         rpm3 = int(max(min(rpm3, self.max_rpm), -self.max_rpm))
@@ -104,6 +126,10 @@ class MotorBridge(Node):
         return packet
     
     def parse_feedback_packet(self, packet):
+        """
+        Parse 18-byte feedback: [0xA5, Tick1(4), Tick2(4), Tick3(4), GyroZ(2), Pitch(2), XOR]
+        ESP32 scales IMU by 1000, we divide back to rad/s and rad.
+        """
         if len(packet) != FEEDBACK_PACKET_SIZE:
             return None
         
@@ -127,16 +153,27 @@ class MotorBridge(Node):
             return None
 
     def cmd_vel_callback(self, msg):
+        """Convert /cmd_vel to wheel RPMs using kiwi drive kinematics"""
         self.last_cmd_time = time.time()
         self.watchdog_triggered = False
         
-        rpm1, rpm2, rpm3 = cmd_vel_to_rpm(
-            msg.linear.x, 
-            msg.linear.y, 
-            msg.angular.z,
-            self.wheel_radius,
-            self.robot_radius
-        )
+        vx = msg.linear.x
+        vy = msg.linear.y
+        wz = msg.angular.z
+        
+        self.get_logger().info(f"Received cmd_vel: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}")
+
+        rotation_vel = self.robot_radius * wz
+        
+        v1 = -0.5 * vx - 0.866 * vy + rotation_vel
+        v2 = -0.5 * vx + 0.866 * vy + rotation_vel
+        v3 = vx + rotation_vel
+    
+        rpm1 = self.velocity_to_rpm(v1)
+        rpm2 = self.velocity_to_rpm(v2)
+        rpm3 = self.velocity_to_rpm(v3)
+        
+        self.get_logger().info(f"Wheel velocities: v1={v1:.3f} v2={v2:.3f} v3={v3:.3f} m/s")
 
         self.send_rpm_command(rpm1, rpm2, rpm3)
     
@@ -144,10 +181,10 @@ class MotorBridge(Node):
         packet = self.build_command_packet(rpm1, rpm2, rpm3)
         
         try:
-            self.ser.write(packet)
+            bytes_written = self.ser.write(packet)
             hex_str = ' '.join(f'{b:02X}' for b in packet)
-            self.get_logger().debug(f"TX [{len(packet)}]: {hex_str}")
-            self.get_logger().info(f"Sent RPM: {int(rpm1)}, {int(rpm2)}, {int(rpm3)}")
+            self.get_logger().info(f"TX [{bytes_written}/{len(packet)} bytes]: {hex_str}")
+            self.get_logger().info(f"RPM Command -> M1:{int(rpm1)} M2:{int(rpm2)} M3:{int(rpm3)}")
         except Exception as e:
             self.get_logger().error(f"Serial Write Error: {e}")
     
@@ -156,6 +193,7 @@ class MotorBridge(Node):
         self.get_logger().warn("STOP command sent!")
     
     def read_feedback_callback(self):
+        """Read and parse incoming feedback packets from ESP32"""
         if self.ser.in_waiting >= FEEDBACK_PACKET_SIZE:
             while self.ser.in_waiting > 0:
                 first_byte = self.ser.read(1)
@@ -203,6 +241,7 @@ class MotorBridge(Node):
             self._last_imu_log_time = current_time
     
     def watchdog_callback(self):
+        """Safety: stop motors if no cmd_vel received within timeout"""
         elapsed = time.time() - self.last_cmd_time
         
         if elapsed > self.watchdog_timeout and not self.watchdog_triggered:
