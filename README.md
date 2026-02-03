@@ -33,7 +33,7 @@ File ini adalah skrip konfigurasi berbasis `setuptools` yang digunakan oleh sist
 * **Definisi Paket:** Menyatakan metadata paket seperti nama, versi, dan pengelola (maintainer).
 * **Instalasi Resource:** Melalui parameter `data_files`, file ini menginstruksikan sistem untuk menyalin file konfigurasi (seperti `package.xml` dan file dalam folder `resource`) ke direktori instalasi ROS 2.
 * **Entry Points:** Mendefinisikan pemetaan antara perintah terminal ROS 2 dengan fungsi Python yang akan dieksekusi.
-* Contoh: Konfigurasi `console_scripts` memetakan perintah `ros2 run robot_mms mms_node` agar mengeksekusi fungsi `main()` di dalam file `robot_mms/mms_bridge.py`.
+* Contoh: Konfigurasi `console_scripts` memetakan perintah `ros2 run robot_mms mms_bridge` agar mengeksekusi fungsi `main()` di dalam file `robot_mms/mms_bridge.py`.
 
 
 
@@ -82,8 +82,76 @@ source install/setup.bash
 Setelah build berhasil, node dapat dijalankan menggunakan perintah berikut:
 
 ```bash
-ros2 run robot_mms mms_node
-
+ros2 run robot_mms mms_bridge
 ```
 
-Pastikan mikrokontroler ESP32 telah terhubung ke port USB sebelum menjalankan node ini. Konfigurasi port serial dapat diubah melalui parameter ROS (lihat file konfigurasi di paket `robot_bringup`).
+Pastikan mikrokontroler ESP32 telah terhubung ke port USB sebelum menjalankan node ini. Konfigurasi port serial dan parameter robot dapat diubah via ROS parameters (lihat bagian YAML di bawah).
+
+### Konfigurasi Parameter (YAML)
+
+Paket ini menyediakan file parameter bawaan: `config/mms_params.yaml` (ter-install ke `share/robot_mms/config`).
+
+Contoh menjalankan node dengan params file:
+
+```bash
+ros2 run robot_mms mms_bridge --ros-args --params-file \
+  $(ros2 pkg prefix robot_mms)/share/robot_mms/config/mms_params.yaml
+```
+
+Parameter yang umum diubah:
+- `serial_port` (default `/dev/ttyUSB0`)
+- `wheel_radius`, `robot_radius`, `ticks_per_rev`
+- `watchdog_timeout_s`
+- `odom_frame_id`, `base_frame_id`
+
+Catatan: `serial_reset_buffers_on_start` default `false` untuk menghindari pembuangan data valid saat startup.
+
+### Reset Odometry
+
+Untuk kebutuhan testing/kalibrasi, tersedia service untuk mereset odom:
+
+```bash
+ros2 service call /reset_odom std_srvs/srv/Empty "{}"
+```
+
+Catatan: publisher encoder/IMU memakai QoS `sensor_data` (lebih responsif, tidak menumpuk antrian).
+
+## Troubleshooting
+
+Jika robot tidak bergerak saat publish ke `/cmd_vel`, gunakan diagnostic tools berikut:
+
+### 1. Diagnostic Lengkap
+```bash
+# Terminal 1: Jalankan diagnostic
+python3 ~/robot_2026/diagnose_ros_communication.py
+
+# Terminal 2: Test publish
+ros2 topic pub /cmd_vel geometry_msgs/msg/Twist \
+  "{linear: {x: 0.1, y: 0.0, z: 0.0}, angular: {z: 0.0}}" --once
+```
+
+### 2. Verifikasi Kinematika
+```bash
+python3 ~/robot_2026/test_kinematics.py
+```
+
+### 3. Test Serial Langsung (Bypass ROS)
+```bash
+python3 ~/robot_2026/test_esp32_direct.py
+```
+
+### Quick Checks
+```bash
+# Cek node berjalan
+ros2 node list
+
+# Cek subscriber /cmd_vel
+ros2 topic info /cmd_vel
+
+# Monitor feedback dari ESP32
+ros2 topic echo /encoder_ticks
+ros2 topic echo /imu_raw
+
+# Cek device serial
+ls /dev/ttyUSB*
+```

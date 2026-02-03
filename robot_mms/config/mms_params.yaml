@@ -1,0 +1,34 @@
+motor_bridge_node:
+  ros__parameters:
+    # Serial
+    serial_port: /dev/ttyUSB0
+    serial_baudrate: 115200
+    serial_timeout_s: 0.01
+    serial_boot_wait_s: 2.5
+    serial_mode_switch_wait_s: 0.5
+    serial_sync_max_attempts: 2000
+    # Set true only if you must force-clear garbage; may drop valid bytes.
+    serial_reset_buffers_on_start: false
+
+    # Robot geometry
+    wheel_radius: 0.05
+    robot_radius: 0.10
+    ticks_per_rev: 380
+    max_rpm: 600
+
+    # Safety
+    watchdog_timeout_s: 0.5
+
+    # Frames
+    odom_frame_id: odom
+    base_frame_id: base_link
+
+    # Topics
+    cmd_vel_topic: /cmd_vel
+    encoder_ticks_topic: /encoder_ticks
+    imu_raw_topic: /imu_raw
+    imu_data_topic: /imu/data
+    odom_topic: /odom
+
+    # Service
+    reset_odom_service: /reset_odom

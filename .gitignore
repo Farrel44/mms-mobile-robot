@@ -134,6 +134,9 @@ COLCON_IGNORE
 *.db3-shm
 *.db3-wal
 
+test_kinematics.py
+diagnose_ros_communication.py
+
 # ========================================
 # Misc
 # ========================================
