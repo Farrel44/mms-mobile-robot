@@ -13,6 +13,7 @@ def cmd_vel_to_wheel_velocities(vx, vy, wz, robot_radius):
     v2 = -0.5 * vx + sqrt3_over_2 * vy + rotation_vel
     v3 = vx + rotation_vel
     
+    
     return v1, v2, v3
 
 def cmd_vel_to_rpm(vx, vy, wz, wheel_radius, robot_radius):

@@ -18,6 +18,9 @@ import struct
 import time
 import math
 import threading
+from typing import Any, Callable, TypeVar
+
+T = TypeVar('T')
 
 from . import kinematics
 
@@ -28,6 +31,25 @@ FEEDBACK_PACKET_SIZE = 18
 class MotorBridge(Node):
     def __init__(self):
         super().__init__('motor_bridge_node')
+
+        def as_int(v: Any) -> int:
+            return int(v)
+
+        def as_float(v: Any) -> float:
+            return float(v)
+
+        def as_bool(v: Any) -> bool:
+            return bool(v)
+
+        def as_str(v: Any) -> str:
+            return str(v)
+
+        def get_param(name: str, default: T, conv: Callable[[object], T]) -> T:
+            # Parameter selalu punya default, tapi type-checker kadang melihat None.
+            value = self.get_parameter(name).value
+            if value is None:
+                return default
+            return conv(value)
 
         # Parameters (defaults match previous hardcoded values)
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
@@ -53,20 +75,20 @@ class MotorBridge(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('reset_odom_service', '/reset_odom')
 
-        self.serial_port = self.get_parameter('serial_port').value
-        self.serial_baudrate = int(self.get_parameter('serial_baudrate').value)
-        self.serial_timeout_s = float(self.get_parameter('serial_timeout_s').value)
-        self.serial_boot_wait_s = float(self.get_parameter('serial_boot_wait_s').value)
-        self.serial_mode_switch_wait_s = float(self.get_parameter('serial_mode_switch_wait_s').value)
-        self.serial_sync_max_attempts = int(self.get_parameter('serial_sync_max_attempts').value)
-        self.serial_reset_buffers_on_start = bool(self.get_parameter('serial_reset_buffers_on_start').value)
+        self.serial_port = get_param('serial_port', '/dev/ttyUSB0', as_str)
+        self.serial_baudrate = get_param('serial_baudrate', 115200, as_int)
+        self.serial_timeout_s = get_param('serial_timeout_s', 0.01, as_float)
+        self.serial_boot_wait_s = get_param('serial_boot_wait_s', 2.5, as_float)
+        self.serial_mode_switch_wait_s = get_param('serial_mode_switch_wait_s', 0.5, as_float)
+        self.serial_sync_max_attempts = get_param('serial_sync_max_attempts', 2000, as_int)
+        self.serial_reset_buffers_on_start = get_param('serial_reset_buffers_on_start', False, as_bool)
 
-        self.wheel_radius = float(self.get_parameter('wheel_radius').value)
-        self.robot_radius = float(self.get_parameter('robot_radius').value)
-        self.ticks_per_rev = int(self.get_parameter('ticks_per_rev').value)
-        self.max_rpm = int(self.get_parameter('max_rpm').value)
+        self.wheel_radius = get_param('wheel_radius', 0.05, as_float)
+        self.robot_radius = get_param('robot_radius', 0.10, as_float)
+        self.ticks_per_rev = get_param('ticks_per_rev', 380, as_int)
+        self.max_rpm = get_param('max_rpm', 600, as_int)
 
-        self.watchdog_timeout = float(self.get_parameter('watchdog_timeout_s').value)
+        self.watchdog_timeout = get_param('watchdog_timeout_s', 0.5, as_float)
         self.last_cmd_stamp = self.get_clock().now()
         self.watchdog_triggered = False
             
