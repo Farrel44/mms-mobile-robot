@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-ROS2 node bridging /cmd_vel to ESP32 motor controller via binary serial protocol.
-Implements 500ms watchdog for safety and publishes encoder + IMU feedback.
+Node ROS2 untuk bridge /cmd_vel <-> ESP32 via protokol serial biner.
+
+Alur utama:
+  Command : /cmd_vel -> inverse kinematics -> RPM -> serial TX
+  Feedback: serial RX -> forward kinematics -> odometry -> /odom + TF + /imu
 """
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from geometry_msgs.msg import Twist
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32MultiArray
@@ -18,40 +20,89 @@ import struct
 import time
 import math
 import threading
-from typing import Any, Callable, TypeVar
-
-T = TypeVar('T')
 
 from . import kinematics
 
+# Protokol serial (sesuai firmware ESP32)
 PACKET_HEADER = 0xA5
-CMD_PACKET_SIZE = 8
-FEEDBACK_PACKET_SIZE = 18
+CMD_PACKET_SIZE = 8       # header(1) + 3×int16(6) + xor(1)
+FEEDBACK_PACKET_SIZE = 18  # header(1) + 3×int32(12) + 2×int16(4) + xor(1)
+
 
 class MotorBridge(Node):
     def __init__(self):
         super().__init__('motor_bridge_node')
 
-        def as_int(v: Any) -> int:
-            return int(v)
+        # =============================================================
+        # Deklarasi & baca semua parameter ROS
+        # =============================================================
+        self._declare_all_parameters()
+        self._load_all_parameters()
 
-        def as_float(v: Any) -> float:
-            return float(v)
+        # =============================================================
+        # State watchdog (stop motor kalau cmd_vel timeout)
+        # =============================================================
+        self.last_cmd_stamp = self.get_clock().now()
+        self.watchdog_triggered = False
 
-        def as_bool(v: Any) -> bool:
-            return bool(v)
+        # =============================================================
+        # State feedback (diakses dari callback serial & publisher)
+        # =============================================================
+        self.feedback_lock = threading.Lock()
+        self.encoder_ticks = [0, 0, 0]
+        self.gyro_z = 0.0
+        self.angle_x_rad = 0.0
 
-        def as_str(v: Any) -> str:
-            return str(v)
+        # =============================================================
+        # State odometry: pose (x, y, yaw) di frame odom
+        # =============================================================
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.last_feedback_stamp = None
 
-        def get_param(name: str, default: T, conv: Callable[[object], T]) -> T:
-            # Parameter selalu punya default, tapi type-checker kadang melihat None.
-            value = self.get_parameter(name).value
-            if value is None:
-                return default
-            return conv(value)
+        # Twist terakhir (untuk di-publish di /odom)
+        self.last_vx = 0.0
+        self.last_vy = 0.0
+        self.last_wz = 0.0
+        self.last_odom_stamp = None
 
-        # Parameters (defaults match previous hardcoded values)
+        # =============================================================
+        # Buffer RX serial (stream-safe, partial-packet handling)
+        # =============================================================
+        self.rx_buf = bytearray()
+
+        # =============================================================
+        # Koneksi serial ke ESP32
+        # =============================================================
+        try:
+            self.ser = serial.Serial(
+                self.serial_port,
+                self.serial_baudrate,
+                timeout=self.serial_timeout_s,
+            )
+            self._init_serial_connection()
+            self.get_logger().info(
+                f'Serial terhubung: {self.serial_port} @ {self.serial_baudrate}'
+            )
+        except Exception as e:
+            self.get_logger().error(f'Gagal koneksi serial: {e}')
+            raise SystemExit(1)
+
+        # =============================================================
+        # ROS subscribers, publishers, services, timers
+        # =============================================================
+        self._setup_ros_interfaces()
+
+        self.get_logger().info('Motor bridge siap')
+
+    # =================================================================
+    # Parameter
+    # =================================================================
+
+    def _declare_all_parameters(self):
+        """Deklarasi parameter dengan default value."""
+        # Serial
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('serial_baudrate', 115200)
         self.declare_parameter('serial_timeout_s', 0.01)
@@ -60,12 +111,16 @@ class MotorBridge(Node):
         self.declare_parameter('serial_sync_max_attempts', 2000)
         self.declare_parameter('serial_reset_buffers_on_start', False)
 
+        # Geometri robot
         self.declare_parameter('wheel_radius', 0.05)
         self.declare_parameter('robot_radius', 0.10)
         self.declare_parameter('ticks_per_rev', 380)
         self.declare_parameter('max_rpm', 600)
 
+        # Safety
         self.declare_parameter('watchdog_timeout_s', 0.5)
+
+        # Frame & topic names
         self.declare_parameter('odom_frame_id', 'odom')
         self.declare_parameter('base_frame_id', 'base_link')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
@@ -75,114 +130,106 @@ class MotorBridge(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('reset_odom_service', '/reset_odom')
 
-        self.serial_port = get_param('serial_port', '/dev/ttyUSB0', as_str)
-        self.serial_baudrate = get_param('serial_baudrate', 115200, as_int)
-        self.serial_timeout_s = get_param('serial_timeout_s', 0.01, as_float)
-        self.serial_boot_wait_s = get_param('serial_boot_wait_s', 2.5, as_float)
-        self.serial_mode_switch_wait_s = get_param('serial_mode_switch_wait_s', 0.5, as_float)
-        self.serial_sync_max_attempts = get_param('serial_sync_max_attempts', 2000, as_int)
-        self.serial_reset_buffers_on_start = get_param('serial_reset_buffers_on_start', False, as_bool)
+    def _load_all_parameters(self):
+        """Baca nilai parameter ke atribut instance."""
+        def _get(name, default, conv):
+            val = self.get_parameter(name).value
+            return conv(val) if val is not None else default
 
-        self.wheel_radius = get_param('wheel_radius', 0.05, as_float)
-        self.robot_radius = get_param('robot_radius', 0.10, as_float)
-        self.ticks_per_rev = get_param('ticks_per_rev', 380, as_int)
-        self.max_rpm = get_param('max_rpm', 600, as_int)
+        # Serial
+        self.serial_port = _get('serial_port', '/dev/ttyUSB0', str)
+        self.serial_baudrate = _get('serial_baudrate', 115200, int)
+        self.serial_timeout_s = _get('serial_timeout_s', 0.01, float)
+        self.serial_boot_wait_s = _get('serial_boot_wait_s', 2.5, float)
+        self.serial_mode_switch_wait_s = _get('serial_mode_switch_wait_s', 0.5, float)
+        self.serial_sync_max_attempts = _get('serial_sync_max_attempts', 2000, int)
+        self.serial_reset_buffers_on_start = _get('serial_reset_buffers_on_start', False, bool)
 
-        self.watchdog_timeout = get_param('watchdog_timeout_s', 0.5, as_float)
-        self.last_cmd_stamp = self.get_clock().now()
-        self.watchdog_triggered = False
-            
-        # Thread-safe feedback state shared between serial reader and publishers
-        self.encoder_ticks = [0, 0, 0]
-        self.gyro_z = 0.0
-        self.angle_x_rad = 0.0
+        # Geometri
+        self.wheel_radius = _get('wheel_radius', 0.05, float)
+        self.robot_radius = _get('robot_radius', 0.10, float)
+        self.ticks_per_rev = _get('ticks_per_rev', 380, int)
+        self.max_rpm = _get('max_rpm', 600, int)
 
-        # Odometry state (odom -> base_link)
-        self.odom_frame_id = str(self.get_parameter('odom_frame_id').value)
-        self.base_frame_id = str(self.get_parameter('base_frame_id').value)
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = 0.0
-        self._last_feedback_stamp = None
+        # Safety
+        self.watchdog_timeout = _get('watchdog_timeout_s', 0.5, float)
 
-        self.feedback_lock = threading.Lock()
+        # Frame
+        self.odom_frame_id = _get('odom_frame_id', 'odom', str)
+        self.base_frame_id = _get('base_frame_id', 'base_link', str)
 
-        # Serial RX buffer for stream-safe parsing (handles partial reads/resync)
-        self._rx_buf = bytearray()
-        
-        try:
-            self.ser = serial.Serial(
-                self.serial_port,
-                self.serial_baudrate,
-                timeout=self.serial_timeout_s,
-            )
-            self._init_serial_connection()
-            self.get_logger().info(
-                f"Serial connected to ESP32 on {self.serial_port} @ {self.serial_baudrate}"
-            )
-        except Exception as e:
-            self.get_logger().error(f"Serial connection failed: {e}")
-            exit()
+    def _setup_ros_interfaces(self):
+        """Buat subscriber, publisher, service, dan timer."""
+        def _get_str(name):
+            val = self.get_parameter(name).value
+            return str(val) if val is not None else ''
 
-        cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
-        self.subscription = self.create_subscription(Twist, cmd_vel_topic, self.cmd_vel_callback, 10)
-        
-        encoder_ticks_topic = str(self.get_parameter('encoder_ticks_topic').value)
-        imu_raw_topic = str(self.get_parameter('imu_raw_topic').value)
-        imu_data_topic = str(self.get_parameter('imu_data_topic').value)
-        odom_topic = str(self.get_parameter('odom_topic').value)
+        cmd_vel_topic = _get_str('cmd_vel_topic')
+        encoder_topic = _get_str('encoder_ticks_topic')
+        imu_raw_topic = _get_str('imu_raw_topic')
+        imu_data_topic = _get_str('imu_data_topic')
+        odom_topic = _get_str('odom_topic')
+        reset_srv_name = _get_str('reset_odom_service')
 
-        # QoS sensor_data: utamakan data terbaru, tidak menumpuk queue.
-        self.encoder_pub = self.create_publisher(Float32MultiArray, encoder_ticks_topic, qos_profile_sensor_data)
-        self.imu_pub = self.create_publisher(Float32MultiArray, imu_raw_topic, qos_profile_sensor_data)
-        self.imu_data_pub = self.create_publisher(Imu, imu_data_topic, qos_profile_sensor_data)
+        # Subscriber
+        self.create_subscription(Twist, cmd_vel_topic, self.cmd_vel_callback, 10)
 
-        # Odometry biasanya dipakai node lain untuk integrasi/TF, tetap reliable (default).
+        # Publisher debug (sensor QoS: data terbaru, tidak numpuk)
+        self.encoder_pub = self.create_publisher(
+            Float32MultiArray, encoder_topic, qos_profile_sensor_data)
+        self.imu_raw_pub = self.create_publisher(
+            Float32MultiArray, imu_raw_topic, qos_profile_sensor_data)
+
+        # Publisher standar
+        self.imu_data_pub = self.create_publisher(
+            Imu, imu_data_topic, qos_profile_sensor_data)
         self.odom_pub = self.create_publisher(Odometry, odom_topic, 10)
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # Service sederhana untuk reset odom saat testing/kalibrasi.
-        reset_srv_name = str(self.get_parameter('reset_odom_service').value)
-        self.reset_odom_srv = self.create_service(Empty, reset_srv_name, self.reset_odom_callback)
-        
-        self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)
-        self.serial_read_timer = self.create_timer(0.02, self.read_feedback_callback)
-        
-        self.get_logger().info("Motor bridge ready")
+        # Service reset odom
+        self.create_service(Empty, reset_srv_name, self.reset_odom_callback)
+
+        # Timer: baca serial (~50 Hz) dan watchdog (~10 Hz)
+        self.create_timer(0.02, self.read_feedback_callback)
+        self.create_timer(0.1, self.watchdog_callback)
+
+    # =================================================================
+    # Serial I/O (Transport Layer)
+    # =================================================================
 
     def _init_serial_connection(self):
-        """Sync to ESP32 packet stream, preventing boot message corruption in buffer"""
-        self.get_logger().info("Initializing serial connection...")
+        """Startup serial: tunggu boot ESP32 -> mode binary -> sync paket."""
+        self.get_logger().info('Inisialisasi serial...')
 
         if self.serial_reset_buffers_on_start:
-            # Optional: can be helpful if the port is noisy, but may drop valid bytes.
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
 
         if self.serial_boot_wait_s > 0.0:
             time.sleep(self.serial_boot_wait_s)
-        
-        # Send binary mode command
-        self.get_logger().info("Switching ESP32 to binary mode...")
+
+        # Masuk mode binary (sesuai firmware ESP32)
+        self.get_logger().info('Switch ke binary mode...')
         self.ser.write(b'b')
 
         if self.serial_mode_switch_wait_s > 0.0:
             time.sleep(self.serial_mode_switch_wait_s)
-        
-        self.get_logger().info("Binary mode active, syncing to feedback stream...")
-        if self._sync_to_packet(max_attempts=self.serial_sync_max_attempts):
-            self.get_logger().info("Serial sync complete (valid packet found)")
+
+        # Sync: cari paket feedback valid pertama
+        self.get_logger().info('Sync ke stream feedback...')
+        if self._sync_to_packet(self.serial_sync_max_attempts):
+            self.get_logger().info('Sync OK (paket valid ditemukan)')
         else:
-            self.get_logger().warn("Serial sync failed (no valid packet found yet)")
-    
+            self.get_logger().warn('Sync gagal (belum ada paket valid)')
+
     def _sync_to_packet(self, max_attempts=1000):
-        """Find a valid feedback packet by streaming bytes into the RX buffer."""
+        """Baca bytes sampai ketemu 1 feedback packet valid."""
         for _ in range(max_attempts):
-            n = int(getattr(self.ser, 'in_waiting', 0) or 0)
-            if n <= 0:
-                chunk = self.ser.read(1)
+            waiting = self.ser.in_waiting or 0
+            if waiting > 0:
+                chunk = self.ser.read(min(int(waiting), 256))
             else:
-                chunk = self.ser.read(min(n, 256))
+                chunk = self.ser.read(1)
 
             if chunk:
                 self._feed_rx(chunk)
@@ -194,19 +241,19 @@ class MotorBridge(Node):
         return False
 
     def _feed_rx(self, data):
+        """Tambah data ke buffer RX, batasi ukuran agar tidak membengkak."""
         if not data:
             return
-        self._rx_buf.extend(data)
-
-        # Prevent unbounded growth if noise/no headers.
-        if len(self._rx_buf) > 4096:
-            self._rx_buf = self._rx_buf[-1024:]
+        self.rx_buf.extend(data)
+        # Buang data lama kalau buffer terlalu besar (noise tanpa header)
+        if len(self.rx_buf) > 4096:
+            self.rx_buf = self.rx_buf[-1024:]
 
     def _extract_feedback_packets(self, max_packets=None):
-        """Extract valid 18-byte feedback packets from the RX buffer.
+        """Ambil semua feedback packet valid dari buffer RX.
 
-        - Keeps partial packets in the buffer.
-        - On checksum failure, drops one byte and continues (resync).
+        - Paket belum lengkap disimpan (tidak dibuang).
+        - Checksum gagal: buang 1 byte, lanjut cari header (resync).
         """
         packets = []
         header_byte = bytes([PACKET_HEADER])
@@ -215,327 +262,362 @@ class MotorBridge(Node):
             if max_packets is not None and len(packets) >= max_packets:
                 break
 
-            idx = self._rx_buf.find(header_byte)
+            # Cari posisi header 0xA5
+            idx = self.rx_buf.find(header_byte)
             if idx < 0:
-                # No header present: drop all buffered noise
-                self._rx_buf.clear()
+                self.rx_buf.clear()
                 break
 
+            # Buang noise sebelum header
             if idx > 0:
-                # Drop noise before header
-                del self._rx_buf[:idx]
+                del self.rx_buf[:idx]
 
-            if len(self._rx_buf) < FEEDBACK_PACKET_SIZE:
+            # Tunggu sampai data cukup 18 byte
+            if len(self.rx_buf) < FEEDBACK_PACKET_SIZE:
                 break
 
-            candidate = bytes(self._rx_buf[:FEEDBACK_PACKET_SIZE])
+            candidate = bytes(self.rx_buf[:FEEDBACK_PACKET_SIZE])
             if self.verify_checksum(candidate):
                 packets.append(candidate)
-                del self._rx_buf[:FEEDBACK_PACKET_SIZE]
-                continue
-
-            # Bad checksum: drop one byte (the header) and resync
-            del self._rx_buf[:1]
+                del self.rx_buf[:FEEDBACK_PACKET_SIZE]
+            else:
+                # Checksum gagal: buang 1 byte dan resync
+                del self.rx_buf[:1]
 
         return packets
 
-    def reset_odom_callback(self, request, response):
-        # Reset posisi odom tanpa mengubah koneksi serial.
-        with self.feedback_lock:
-            self.x = 0.0
-            self.y = 0.0
-            self.yaw = 0.0
-            self._last_feedback_stamp = None
-            self._last_vx = 0.0
-            self._last_vy = 0.0
-            self._last_wz = 0.0
-
-        self.get_logger().info("Odom reset: x=0 y=0 yaw=0")
-        return response
+    # =================================================================
+    # Checksum & Packet Building (Protokol)
+    # =================================================================
 
     def calculate_checksum(self, data):
+        """XOR checksum semua byte."""
         checksum = 0
-        for byte in data:
-            checksum ^= byte
+        for b in data:
+            checksum ^= b
         return checksum & 0xFF
-    
+
     def verify_checksum(self, packet):
+        """Cek XOR checksum byte terakhir."""
         if len(packet) < 2:
             return False
-        data = packet[:-1]
-        received_checksum = packet[-1]
-        calculated = self.calculate_checksum(data)
-        return calculated == received_checksum
-    
+        expected = self.calculate_checksum(packet[:-1])
+        return expected == packet[-1]
+
     def build_command_packet(self, rpm1, rpm2, rpm3):
-        """Build 8-byte command: [0xA5, RPM1(2), RPM2(2), RPM3(2), XOR]"""
+        """Bangun paket command 8 byte: [0xA5, RPM1(2), RPM2(2), RPM3(2), XOR].
+
+        RPM di-clamp ke ±max_rpm, format big-endian int16.
+        """
         rpm1 = int(max(min(rpm1, self.max_rpm), -self.max_rpm))
         rpm2 = int(max(min(rpm2, self.max_rpm), -self.max_rpm))
         rpm3 = int(max(min(rpm3, self.max_rpm), -self.max_rpm))
-        
+
         rpm_bytes = struct.pack('>hhh', rpm1, rpm2, rpm3)
         packet = bytes([PACKET_HEADER]) + rpm_bytes
         checksum = self.calculate_checksum(packet)
-        packet += bytes([checksum])
-        
-        return packet
-    
+        return packet + bytes([checksum])
+
     def parse_feedback_packet(self, packet):
-        """
-        Parse 18-byte feedback: [0xA5, Tick1(4), Tick2(4), Tick3(4), GyroZ(2), AngleX(2), XOR]
-        
-        ESP32 sends:
-        - gyro_z_scaled = gyro_z_rad_s * 1000
-        - angle_x_scaled = angle_x_rad * 1000
+        """Parse feedback 18 byte dari ESP32.
+
+        Format: [0xA5, Tick1(4), Tick2(4), Tick3(4), GyroZ(2), AngleX(2), XOR]
+        ESP32 mengirim gyro & angle dikali 1000 (int16).
+
+        Returns:
+            (delta_ticks, gyro_z_rad_s, angle_x_rad) atau None jika gagal
         """
         if len(packet) != FEEDBACK_PACKET_SIZE:
             return None
-        
         if packet[0] != PACKET_HEADER:
             return None
-        
         if not self.verify_checksum(packet):
-            self.get_logger().warn("Feedback checksum mismatch!")
+            self.get_logger().warn('Checksum feedback tidak cocok!')
             return None
-        
+
         try:
             ticks = struct.unpack('>iii', packet[1:13])
             imu_raw = struct.unpack('>hh', packet[13:17])
-            
-            gyro_z = imu_raw[0] / 1000.0
-            angle_x_rad = imu_raw[1] / 1000.0
-            
-            return (list(ticks), gyro_z, angle_x_rad)
+
+            gyro_z = imu_raw[0] / 1000.0      # rad/s
+            angle_x_rad = imu_raw[1] / 1000.0  # rad
+
+            return list(ticks), gyro_z, angle_x_rad
         except struct.error as e:
-            self.get_logger().error(f"Struct unpack error: {e}")
+            self.get_logger().error(f'Error unpack feedback: {e}')
             return None
 
+    # =================================================================
+    # Command Path: /cmd_vel -> inverse kinematics -> serial TX
+    # =================================================================
+
     def cmd_vel_callback(self, msg):
-        """Convert /cmd_vel to wheel RPMs using kiwi drive kinematics"""
+        """Terima cmd_vel, hitung RPM, kirim ke ESP32."""
         self.last_cmd_stamp = self.get_clock().now()
         self.watchdog_triggered = False
-        
+
         vx = msg.linear.x
         vy = msg.linear.y
         wz = msg.angular.z
-        
-        self.get_logger().info(f"Received cmd_vel: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}")
 
-        v1, v2, v3 = kinematics.cmd_vel_to_wheel_velocities(vx, vy, wz, self.robot_radius)
+        self.get_logger().info(
+            f'cmd_vel: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}')
+
+        # Inverse kinematics: cmd_vel -> kecepatan roda -> RPM
+        v1, v2, v3 = kinematics.cmd_vel_to_wheel_velocities(
+            vx, vy, wz, self.robot_radius)
         rpm1 = kinematics.velocity_to_rpm(v1, self.wheel_radius)
         rpm2 = kinematics.velocity_to_rpm(v2, self.wheel_radius)
         rpm3 = kinematics.velocity_to_rpm(v3, self.wheel_radius)
-        
-        self.get_logger().info(f"Wheel velocities: v1={v1:.3f} v2={v2:.3f} v3={v3:.3f} m/s")
+
+        self.get_logger().info(
+            f'Wheel vel: v1={v1:.3f} v2={v2:.3f} v3={v3:.3f} m/s')
 
         self.send_rpm_command(rpm1, rpm2, rpm3)
-    
+
     def send_rpm_command(self, rpm1, rpm2, rpm3):
+        """Kirim paket RPM ke ESP32."""
         packet = self.build_command_packet(rpm1, rpm2, rpm3)
-        
         try:
-            bytes_written = self.ser.write(packet)
-            hex_str = ' '.join(f'{b:02X}' for b in packet)
-            self.get_logger().info(f"TX [{bytes_written}/{len(packet)} bytes]: {hex_str}")
-            self.get_logger().info(f"RPM Command -> M1:{int(rpm1)} M2:{int(rpm2)} M3:{int(rpm3)}")
+            self.ser.write(packet)
+            self.get_logger().info(
+                f'TX RPM: M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
         except Exception as e:
-            self.get_logger().error(f"Serial Write Error: {e}")
-    
+            self.get_logger().error(f'Error tulis serial: {e}')
+
     def send_stop_command(self):
+        """Kirim RPM=0 ke semua motor."""
         self.send_rpm_command(0, 0, 0)
-        self.get_logger().warn("STOP command sent!")
-    
+        self.get_logger().warn('STOP dikirim!')
+
+    # =================================================================
+    # Feedback Path: serial RX -> forward kinematics -> odometry
+    # =================================================================
+
     def read_feedback_callback(self):
-        """Read and parse incoming feedback packets from ESP32"""
-        n = int(getattr(self.ser, 'in_waiting', 0) or 0)
-        if n > 0:
-            chunk = self.ser.read(n)
-            self._feed_rx(chunk)
-        else:
+        """Baca feedback dari ESP32, proses batch, publish."""
+        waiting = self.ser.in_waiting or 0
+        if waiting <= 0:
             return
+
+        chunk = self.ser.read(int(waiting))
+        self._feed_rx(chunk)
 
         packets = self._extract_feedback_packets()
         if not packets:
             return
 
+        # Parse semua paket valid
         samples = []
-        for packet in packets:
-            result = self.parse_feedback_packet(packet)
-            if not result:
-                continue
-            samples.append(result)
+        for pkt in packets:
+            result = self.parse_feedback_packet(pkt)
+            if result is not None:
+                samples.append(result)
 
         if not samples:
             return
 
         stamp_now = self.get_clock().now()
-        self._handle_feedback_batch(samples, stamp_now)
-        self.publish_feedback()
+        self._integrate_odometry(samples, stamp_now)
+        self._publish_all(stamp_now)
 
-    def _handle_feedback_batch(self, samples, stamp_now):
-        """Update shared state and integrate odometry for 1..N samples.
+    def _integrate_odometry(self, samples, stamp_now):
+        """Integrasi odometry dari batch feedback samples.
 
-        If multiple packets are received in one callback, dt is distributed evenly
-        over the elapsed time since the last callback to avoid dt≈0 integration.
+        Kalau ada N paket sekaligus, dt_total dibagi rata ke N sample
+        supaya tidak ada sample dengan dt=0.
+
+        Integrasi pose:
+          1. Forward kinematics: delta ticks -> vx, vy (body frame)
+          2. Heading: yaw += gyro_z * dt
+          3. Rotasi body -> odom pakai yaw_mid (midpoint, lebih stabil)
+          4. Update posisi x, y
         """
         with self.feedback_lock:
-            # Always publish the latest sample values
+            # Simpan data sample terakhir untuk debug publisher
             ticks_last, gyro_z_last, angle_x_last = samples[-1]
             self.encoder_ticks = ticks_last
             self.gyro_z = gyro_z_last
             self.angle_x_rad = angle_x_last
 
-            if self._last_feedback_stamp is None:
-                self._last_feedback_stamp = stamp_now
+            # Belum ada stamp sebelumnya -> simpan dan skip integrasi
+            if self.last_feedback_stamp is None:
+                self.last_feedback_stamp = stamp_now
                 return
 
-            dt_total = (stamp_now - self._last_feedback_stamp).nanoseconds / 1e9
-            self._last_feedback_stamp = stamp_now
+            dt_total = (stamp_now - self.last_feedback_stamp).nanoseconds / 1e9
+            self.last_feedback_stamp = stamp_now
 
-            # Guard against bad dt (startup jitter / backlog / clock issues)
+            # Guard: skip kalau dt aneh (startup / backlog)
             if dt_total <= 0.0 or dt_total > 0.2:
                 return
 
-            dt_each = dt_total / float(len(samples))
-            if dt_each <= 0.0:
+            dt_per_sample = dt_total / float(len(samples))
+            if dt_per_sample <= 0.0:
                 return
 
-            vx_last = 0.0
-            vy_last = 0.0
-            wz_last = 0.0
+            # Integrasi tiap sample
+            vx_body = 0.0
+            vy_body = 0.0
+            wz_gyro = 0.0
 
-            for ticks, gyro_z, _angle_x_rad in samples:
+            for ticks, gyro_z, _angle_x in samples:
+                # Forward kinematics: delta ticks -> twist body
                 vx, vy, _wz_enc = kinematics.delta_ticks_to_body_twist(
                     ticks,
                     self.ticks_per_rev,
                     self.wheel_radius,
                     self.robot_radius,
-                    dt_each,
+                    dt_per_sample,
                 )
 
-                # Integrate yaw from gyro (preferred over encoder yaw on omni)
-                yaw_prev = self.yaw
-                delta_yaw = gyro_z * dt_each
-                yaw_mid = yaw_prev + 0.5 * delta_yaw
-                self.yaw = yaw_prev + delta_yaw
+                # Heading dari gyro (lebih akurat dari encoder untuk omni)
+                yaw_sebelum = self.yaw
+                delta_yaw = gyro_z * dt_per_sample
+                yaw_mid = yaw_sebelum + 0.5 * delta_yaw  # midpoint
+                self.yaw = yaw_sebelum + delta_yaw
 
-                # Integrate translation in odom frame
-                dx_body = vx * dt_each
-                dy_body = vy * dt_each
+                # Displacement body frame
+                dx_body = vx * dt_per_sample
+                dy_body = vy * dt_per_sample
 
-                cos_y = math.cos(yaw_mid)
-                sin_y = math.sin(yaw_mid)
-                dx = dx_body * cos_y - dy_body * sin_y
-                dy = dx_body * sin_y + dy_body * cos_y
+                # Rotasi body -> odom (pakai yaw midpoint)
+                cos_mid = math.cos(yaw_mid)
+                sin_mid = math.sin(yaw_mid)
+                self.x += dx_body * cos_mid - dy_body * sin_mid
+                self.y += dx_body * sin_mid + dy_body * cos_mid
 
-                self.x += dx
-                self.y += dy
+                # Simpan twist terakhir untuk publish
+                vx_body = vx
+                vy_body = vy
+                wz_gyro = gyro_z
 
-                vx_last = vx
-                vy_last = vy
-                wz_last = gyro_z
+            self.last_vx = vx_body
+            self.last_vy = vy_body
+            self.last_wz = wz_gyro
+            self.last_odom_stamp = stamp_now
 
-            # Cache twist for publishing (last sample)
-            self._last_vx = vx_last
-            self._last_vy = vy_last
-            self._last_wz = wz_last
-            self._last_odom_stamp = stamp_now
-    
-    def publish_feedback(self):
-        stamp = getattr(self, '_last_odom_stamp', None)
-        if stamp is None:
-            stamp = self.get_clock().now()
+    # =================================================================
+    # ROS Interface: Publish odom, TF, IMU, debug topics
+    # =================================================================
 
+    def _publish_all(self, stamp_now):
+        """Publish semua topic: debug, IMU standar, odom, dan TF."""
+        # Ambil snapshot state (thread-safe)
         with self.feedback_lock:
             ticks = list(self.encoder_ticks)
-            gyro_z = float(self.gyro_z)
-            angle_x_rad = float(self.angle_x_rad)
-            x = float(self.x)
-            y = float(self.y)
-            yaw = float(self.yaw)
-            vx = float(getattr(self, '_last_vx', 0.0))
-            vy = float(getattr(self, '_last_vy', 0.0))
-            wz = float(getattr(self, '_last_wz', 0.0))
+            gyro_z = self.gyro_z
+            angle_x_rad = self.angle_x_rad
+            x = self.x
+            y = self.y
+            yaw = self.yaw
+            vx = self.last_vx
+            vy = self.last_vy
+            wz = self.last_wz
 
-        # Debug topics
+        stamp_msg = stamp_now.to_msg()
+
+        # --- Debug: delta ticks ---
         enc_msg = Float32MultiArray()
         enc_msg.data = [float(t) for t in ticks]
         self.encoder_pub.publish(enc_msg)
 
+        # --- Debug: IMU raw ---
         imu_raw_msg = Float32MultiArray()
         imu_raw_msg.data = [gyro_z, angle_x_rad]
-        self.imu_pub.publish(imu_raw_msg)
+        self.imu_raw_pub.publish(imu_raw_msg)
 
-        # Standard IMU
+        # --- IMU standar ---
         imu_msg = Imu()
-        imu_msg.header.stamp = stamp.to_msg()
+        imu_msg.header.stamp = stamp_msg
         imu_msg.header.frame_id = self.base_frame_id
         imu_msg.angular_velocity.z = gyro_z
-        # Unknown orientation/accel (not provided)
+        # Orientation & linear accel belum tersedia
         imu_msg.orientation_covariance[0] = -1.0
         imu_msg.linear_acceleration_covariance[0] = -1.0
         self.imu_data_pub.publish(imu_msg)
 
-        # Odometry
+        # --- Odometry ---
+        half_yaw = yaw * 0.5
+        sin_half = math.sin(half_yaw)
+        cos_half = math.cos(half_yaw)
+
         odom = Odometry()
-        odom.header.stamp = stamp.to_msg()
+        odom.header.stamp = stamp_msg
         odom.header.frame_id = self.odom_frame_id
         odom.child_frame_id = self.base_frame_id
+
         odom.pose.pose.position.x = x
         odom.pose.pose.position.y = y
-
-        half = 0.5 * yaw
-        odom.pose.pose.orientation.z = math.sin(half)
-        odom.pose.pose.orientation.w = math.cos(half)
+        odom.pose.pose.orientation.z = sin_half
+        odom.pose.pose.orientation.w = cos_half
 
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = wz
         self.odom_pub.publish(odom)
 
-        # TF: odom -> base_link
-        t = TransformStamped()
-        t.header.stamp = stamp.to_msg()
-        t.header.frame_id = self.odom_frame_id
-        t.child_frame_id = self.base_frame_id
-        t.transform.translation.x = x
-        t.transform.translation.y = y
-        t.transform.translation.z = 0.0
-        t.transform.rotation.z = math.sin(half)
-        t.transform.rotation.w = math.cos(half)
-        self.tf_broadcaster.sendTransform(t)
+        # --- TF: odom -> base_link ---
+        tf = TransformStamped()
+        tf.header.stamp = stamp_msg
+        tf.header.frame_id = self.odom_frame_id
+        tf.child_frame_id = self.base_frame_id
+        tf.transform.translation.x = x
+        tf.transform.translation.y = y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation.z = sin_half
+        tf.transform.rotation.w = cos_half
+        self.tf_broadcaster.sendTransform(tf)
 
-        # Throttled debug logs (ROS time)
-        if not hasattr(self, '_last_imu_log_stamp'):
-            self._last_imu_log_stamp = stamp
-        if (stamp - self._last_imu_log_stamp).nanoseconds / 1e9 > 1.0:
-            self.get_logger().debug(
-                f"IMU: gyro_z={gyro_z:.4f} rad/s, angle_x={angle_x_rad:.4f} rad | Odom: x={x:.3f} y={y:.3f} yaw={yaw:.3f}"
-            )
-            self._last_imu_log_stamp = stamp
-    
+    # =================================================================
+    # Service: Reset Odometry
+    # =================================================================
+
+    def reset_odom_callback(self, request, response):
+        """Reset posisi odom ke (0, 0, 0) tanpa ganggu serial."""
+        with self.feedback_lock:
+            self.x = 0.0
+            self.y = 0.0
+            self.yaw = 0.0
+            self.last_feedback_stamp = None
+            self.last_vx = 0.0
+            self.last_vy = 0.0
+            self.last_wz = 0.0
+        self.get_logger().info('Odom di-reset: x=0 y=0 yaw=0')
+        return response
+
+    # =================================================================
+    # Watchdog: stop motor kalau cmd_vel timeout
+    # =================================================================
+
     def watchdog_callback(self):
-        """Safety: stop motors if no cmd_vel received within timeout"""
+        """Hentikan motor kalau tidak ada cmd_vel dalam batas waktu."""
         elapsed = (self.get_clock().now() - self.last_cmd_stamp).nanoseconds / 1e9
-        
         if elapsed > self.watchdog_timeout and not self.watchdog_triggered:
-            self.get_logger().warn(f"WATCHDOG: No cmd_vel for {elapsed:.2f}s - Stopping motors!")
+            self.get_logger().warn(
+                f'WATCHDOG: cmd_vel timeout ({elapsed:.2f}s) -> motor stop')
             self.send_stop_command()
             self.watchdog_triggered = True
+
+
+# =================================================================
+# Entry point
+# =================================================================
 
 def main(args=None):
     rclpy.init(args=args)
     node = MotorBridge()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutting down...")
+        node.get_logger().info('Shutting down...')
         node.send_stop_command()
     finally:
         node.ser.close()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
