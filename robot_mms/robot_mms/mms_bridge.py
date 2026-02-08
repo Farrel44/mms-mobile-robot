@@ -192,6 +192,53 @@ class MotorBridge(Node):
         # Timer: baca serial (~50 Hz) dan watchdog (~10 Hz)
         self.create_timer(0.02, self.read_feedback_callback)
         self.create_timer(0.1, self.watchdog_callback)
+        
+    
+    def publish_pose_callback(self):
+        """Publish /odom dan TF walau tidak ada feedback baru."""
+        stamp_now = self.get_clock().now()
+        self._publish_pose_only(stamp_now)
+
+    def _publish_pose_only(self, stamp_now):
+        """Publish odom + TF saja (tanpa debug)."""
+        with self.feedback_lock:
+            x = self.x
+            y = self.y
+            yaw = self.yaw
+            vx = self.last_vx
+            vy = self.last_vy
+            wz = self.last_wz
+
+        stamp_msg = stamp_now.to_msg()
+
+        # Quaternion yaw (2D)
+        half_yaw = yaw * 0.5
+        sin_half = math.sin(half_yaw)
+        cos_half = math.cos(half_yaw)
+
+        odom = Odometry()
+        odom.header.stamp = stamp_msg
+        odom.header.frame_id = self.odom_frame_id
+        odom.child_frame_id = self.base_frame_id
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
+        odom.pose.pose.orientation.z = sin_half
+        odom.pose.pose.orientation.w = cos_half
+        odom.twist.twist.linear.x = vx
+        odom.twist.twist.linear.y = vy
+        odom.twist.twist.angular.z = wz
+        self.odom_pub.publish(odom)
+
+        tf = TransformStamped()
+        tf.header.stamp = stamp_msg
+        tf.header.frame_id = self.odom_frame_id
+        tf.child_frame_id = self.base_frame_id
+        tf.transform.translation.x = x
+        tf.transform.translation.y = y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation.z = sin_half
+        tf.transform.rotation.w = cos_half
+        self.tf_broadcaster.sendTransform(tf)
 
     # =================================================================
     # Serial I/O (Transport Layer)
