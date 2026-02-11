@@ -1,0 +1,22 @@
+mission_sequencer:
+  ros__parameters:
+    # Rate publish /cmd_vel saat RUNNING (Hz)
+    publish_rate_hz: 25.0
+
+    # Batas umur /odom sebelum dianggap stale (ms)
+    # Jika exit mode butuh odom (ANGLE/DIST) dan odom lebih tua dari ini → ERROR
+    odom_max_age_ms: 500.0
+
+    # Berapa tick publish /cmd_vel=0 saat berhenti (PAUSE/ABORT/DONE)
+    # Memastikan motor benar-benar stop sebelum lanjut
+    stop_hold_ticks: 10
+
+    # Saat IDLE/DONE, tetap publish /cmd_vel=0 periodik.
+    # Menghindari watchdog motor_bridge melakukan hard-stop setelah publish berhenti.
+    # Catatan: motor_bridge watchdog_timeout_s default 0.5s.
+    # 2Hz = 0.5s terlalu mepet (jitter bisa bikin watchdog aktif).
+    idle_keepalive_hz: 5.0
+
+    # Batas safety output /cmd_vel (clamp)
+    max_linear_speed: 1.0      # m/s
+    max_angular_speed: 3.14    # rad/s

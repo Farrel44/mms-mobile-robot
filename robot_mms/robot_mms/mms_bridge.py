@@ -192,6 +192,10 @@ class MotorBridge(Node):
         # Timer: baca serial (~50 Hz) dan watchdog (~10 Hz)
         self.create_timer(0.02, self.read_feedback_callback)
         self.create_timer(0.1, self.watchdog_callback)
+
+        # Timer: publish pose/TF periodik agar frame odom selalu ada
+        # (Foxglove/RViz butuh /tf untuk menampilkan daftar fixed frame)
+        self.create_timer(0.1, self.publish_pose_callback)
         
     
     def publish_pose_callback(self):
@@ -661,9 +665,23 @@ def main(args=None):
         node.get_logger().info('Shutting down...')
         node.send_stop_command()
     finally:
-        node.ser.close()
-        node.destroy_node()
-        rclpy.shutdown()
+        # Best-effort cleanup (Ctrl-C handling differs across ROS 2 distros)
+        try:
+            if getattr(node, 'ser', None) is not None:
+                node.ser.close()
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

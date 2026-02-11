@@ -1,157 +1,235 @@
-# robot_mms
+# Robot Omni-Wheel LKS
 
-Paket ini merupakan bagian dari sistem navigasi robot omni-wheel. Modul ini berfungsi sebagai **Mobile Management System (MMS)** yang menangani komunikasi tingkat rendah (driver) antara Raspberry Pi (ROS 2) dan mikrokontroler ESP32.
+Sistem navigasi robot omni-wheel 3 roda untuk kompetisi LKS Mobile Robotics. Menggunakan ROS 2 pada Raspberry Pi sebagai otak utama dan ESP32 sebagai motor controller.
 
-Fungsi utama paket ini adalah mengirimkan instruksi kecepatan roda (RPM) dan menerima data umpan balik sensor (odometri dan sensor jarak).
+Arsitektur: **Indexed Runtime Command Sequencer** (Table-based Motion Sequencer).
+Foxglove = editor tabel step (programming panel). Robot = interpreter + executor.
 
 ## Struktur Direktori
 
-Berikut adalah struktur file standar untuk paket ROS 2 berbasis Python (`ament_python`) yang digunakan dalam proyek ini:
-
-```text
-robot_mms/
-├── robot_mms/                  # Source code Python (Module utama)
-│   ├── __init__.py
-│   ├── mms_bridge.py           # Node utama untuk komunikasi serial & ROS
-│   └── kinematics.py           # Pustaka matematika kinematika robot omni
-├── resource/                   # File penanda untuk sistem build Ament
-│   └── robot_mms
-├── setup.py                    # Skrip konfigurasi instalasi paket
-├── package.xml                 # Metadata paket dan dependensi
-└── README.md                   # Dokumentasi proyek
-
+```
+robot_2026/
+├── robot_mms/                  # [OTOT] Paket driver low-level
+│   ├── robot_mms/
+│   │   ├── mms_bridge.py       # Bridge serial ROS-ESP32
+│   │   └── kinematics.py       # Rumus kinematika omni 3 roda
+│   └── config/
+│       └── mms_params.yaml     # Parameter robot
+│
+├── robot_mission/              # [OTAK] Paket sequencer high-level
+│   ├── robot_mission/
+│   │   └── mission_sequencer.py  # Indexed Runtime Command Sequencer
+│   └── config/
+│       └── sequencer_params.yaml # Parameter sequencer
+│
+├── build/                      # Hasil build (auto-generated)
+├── install/                    # Instalasi paket (auto-generated)
+└── log/                        # Log build (auto-generated)
 ```
 
-## Penjelasan Komponen Utama
+## Instalasi
 
-Bagian ini menjelaskan fungsi teknis dari file-file konfigurasi yang terdapat dalam struktur proyek.
+### Prasyarat
+- ROS 2 (Humble/Iron)
+- Python 3.8+
+- pyserial
 
-### 1. `setup.py`
+### Build Semua Paket
 
-File ini adalah skrip konfigurasi berbasis `setuptools` yang digunakan oleh sistem build ROS 2 (`colcon`) untuk menginstal paket. File ini memiliki tiga fungsi krusial:
-
-* **Definisi Paket:** Menyatakan metadata paket seperti nama, versi, dan pengelola (maintainer).
-* **Instalasi Resource:** Melalui parameter `data_files`, file ini menginstruksikan sistem untuk menyalin file konfigurasi (seperti `package.xml` dan file dalam folder `resource`) ke direktori instalasi ROS 2.
-* **Entry Points:** Mendefinisikan pemetaan antara perintah terminal ROS 2 dengan fungsi Python yang akan dieksekusi.
-* Contoh: Konfigurasi `console_scripts` memetakan perintah `ros2 run robot_mms mms_bridge` agar mengeksekusi fungsi `main()` di dalam file `robot_mms/mms_bridge.py`.
-
-
-
-### 2. Direktori `resource/`
-
-Direktori ini berisi satu file kosong dengan nama yang sama persis dengan nama paket (`robot_mms`).
-
-* **Fungsi Teknis:** File ini berfungsi sebagai "marker" (penanda) untuk **Ament Index**, yaitu sistem penemuan paket di ROS 2.
-* **Mekanisme:** Karena Python tidak memiliki manifest paket bawaan yang efisien untuk pencarian cepat, ROS 2 mencari keberadaan file penanda ini di jalur instalasi untuk memverifikasi bahwa paket `robot_mms` telah terinstal. Tanpa file ini, perintah seperti `ros2 pkg list` atau `ros2 run` tidak akan dapat mendeteksi paket, meskipun kode sumber Python sudah benar.
-
-### 3. `robot_mms/` (Python Module)
-
-Direktori ini berisi kode sumber logika program.
-
-* `mms_bridge.py`: Node ROS 2 yang melakukan *parsing* data biner dari serial port ESP32 dan mempublikasikan topik ROS.
-* `kinematics.py`: Berisi perhitungan matriks *Inverse Kinematics* (menerjemahkan kecepatan linear/angular menjadi RPM roda) dan *Forward Kinematics* (menerjemahkan putaran roda menjadi posisi robot).
-
-## Instalasi dan Build
-
-Ikuti langkah berikut untuk membangun paket ini di lingkungan ROS 2:
-
-1. Masuk ke direktori workspace:
 ```bash
-cd ~/robot_ws
-
-```
-
-
-2. Lakukan build paket menggunakan `colcon`:
-```bash
-colcon build --packages-select robot_mms
-
-```
-
-
-3. Source setup file untuk mendaftarkan paket ke lingkungan shell saat ini:
-```bash
+cd ~/robot_2026
+colcon build
 source install/setup.bash
-
 ```
 
-
+Tambahkan ke `~/.bashrc` agar otomatis source saat buka terminal:
+```bash
+echo "source ~/robot_2026/install/setup.bash" >> ~/.bashrc
+```
 
 ## Penggunaan
 
-Setelah build berhasil, node dapat dijalankan menggunakan perintah berikut:
+### 1. Jalankan Driver (robot_mms)
+
+Pastikan ESP32 terhubung via USB.
 
 ```bash
 ros2 run robot_mms mms_bridge
 ```
 
-Pastikan mikrokontroler ESP32 telah terhubung ke port USB sebelum menjalankan node ini. Konfigurasi port serial dan parameter robot dapat diubah via ROS parameters (lihat bagian YAML di bawah).
-
-### Konfigurasi Parameter (YAML)
-
-Paket ini menyediakan file parameter bawaan: `config/mms_params.yaml` (ter-install ke `share/robot_mms/config`).
-
-Contoh menjalankan node dengan params file:
-
+Dengan parameter kustom:
 ```bash
-ros2 run robot_mms mms_bridge --ros-args --params-file \
-  $(ros2 pkg prefix robot_mms)/share/robot_mms/config/mms_params.yaml
+ros2 run robot_mms mms_bridge --ros-args \
+  --params-file $(ros2 pkg prefix robot_mms)/share/robot_mms/config/mms_params.yaml
 ```
 
-Parameter yang umum diubah:
-- `serial_port` (default `/dev/ttyUSB0`)
-- `wheel_radius`, `robot_radius`, `ticks_per_rev`
-- `watchdog_timeout_s`
-- `odom_frame_id`, `base_frame_id`
+### 2. Jalankan Sequencer (robot_mission)
 
-Catatan: `serial_reset_buffers_on_start` default `false` untuk menghindari pembuangan data valid saat startup.
+```bash
+ros2 run robot_mission mission_sequencer
+```
 
-### Reset Odometry
+### 3. Jalankan Foxglove Bridge untuk visualisasi
+```bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+```
 
-Untuk kebutuhan testing/kalibrasi, tersedia service untuk mereset odom:
+Foxglove Bridge akan otomatis subscribe semua topics dan menyediakannya via WebSocket di port 8765.
 
+### 4. Hubungkan Foxglove ke Robot
+
+**Di Foxglove Studio:**
+1. Klik **"Open connection"** (dashboard atau menu kiri)
+2. Pilih **"Foxglove WebSocket"**
+3. Masukkan URL: `ws://192.168.0.67:8765` (ganti IP sesuai robot)
+4. Klik **"Open"**
+
+> **Catatan:** Untuk development lokal, gunakan `ws://localhost:8765`
+
+### 5. Kontrol via Foxglove
+
+Gunakan panel **Publish** untuk mengirim perintah ke topic `/mission/control` dengan tipe `std_msgs/String`.
+
+**Konsep:** Foxglove adalah **editor tabel runtime** (bukan teleop). Setiap baris = 1 step. Robot mengeksekusi step berdasarkan index, berpindah saat exit condition terpenuhi.
+
+> 📖 **Panduan Setup Panel Foxglove:** Lihat [docs/FOXGLOVE_PANELS.md](docs/FOXGLOVE_PANELS.md) untuk panduan lengkap setup visualization, mission control, telemetry, dan debug panels.
+
+Contoh command:
+
+| Aksi | JSON |
+|------|------|
+| Kirim tabel + siap RUN | `{"cmd":"EXECUTE_RAW","steps":[{"cmd":"MAJU","x":0.2,"y":0,"w":0,"exit":{"mode":"TIME","op":">=","val":2000}},{"cmd":"PUTAR_KANAN","x":0,"y":0,"w":1.0,"exit":{"mode":"ANGLE","op":"<=","val":-90}}]}` |
+| RUN | `{"cmd":"RUN"}` |
+| Pause | `{"cmd":"PAUSE"}` |
+| Resume | `{"cmd":"RESUME"}` |
+| Abort | `{"cmd":"ABORT"}` |
+| Set index | `{"cmd":"SET_INDEX","index":2}` |
+| Update tabel (saat RUNNING: lock step aktif) | `{"cmd":"UPDATE_STEPS","steps":[...]}` |
+
+### 5. Monitor Status
+
+Status sequencer tersedia di topic `/mission/status` dalam format JSON.
+
+```bash
+ros2 topic echo /mission/status
+```
+
+## Command Dictionary (CMD yang Didukung)
+
+Setiap CMD = intent, bukan velocity mentah. X/Y/W = parameter per-CMD.
+
+| CMD | Deskripsi | X | Y | W |
+|-----|-----------|---|---|---|
+| MAJU | Maju (+X base_link) | speed (m/s) | - | - |
+| MUNDUR | Mundur (-X base_link) | speed (m/s) | - | - |
+| KIRI | Strafe kiri (+Y) | - | speed (m/s) | - |
+| KANAN | Strafe kanan (-Y) | - | speed (m/s) | - |
+| PUTAR_KIRI | Putar CCW | - | - | speed (rad/s) |
+| PUTAR_KANAN | Putar CW | - | - | speed (rad/s) |
+| BALANCE | Stabilisasi (pass-through) | param | param | param |
+| STOP | Diam total | - | - | - |
+
+## Exit Condition (per step)
+
+Step berpindah **hanya** jika exit condition terpenuhi.
+
+| Mode | Satuan | Deskripsi |
+|------|--------|-----------|
+| TIME | ms | Waktu sejak step dimulai |
+| ANGLE | degree | Delta yaw akumulasi (CCW +, CW −) |
+| DIST | meter | Jarak euclidean dari posisi start |
+
+Comparator (`op`): `>=`, `<=`, `>`, `<`, `==`
+
+## Contoh Payload (Referensi)
+
+```json
+{
+  "cmd": "EXECUTE_RAW",
+  "steps": [
+    { "cmd": "BALANCE", "x": 10, "y": 0, "w": 0, "exit": { "mode": "TIME", "op": ">=", "val": 3000 } },
+    { "cmd": "MAJU", "x": 0, "y": 0, "w": 0, "exit": { "mode": "TIME", "op": ">=", "val": 700 } },
+    { "cmd": "PUTAR_KANAN", "x": 0, "y": 0, "w": 0, "exit": { "mode": "ANGLE", "op": "<=", "val": -180 } }
+  ]
+}
+```
+
+Representasi visual di Foxglove:
+```
+[0] CMD=BALANCE      X=10  Y=0  W=0  EXIT=TIME >= 3000
+[1] CMD=MAJU         X=0   Y=0  W=0  EXIT=TIME >= 700
+[2] CMD=PUTAR_KANAN  X=0   Y=0  W=0  EXIT=ANGLE <= -180
+```
+
+## Parameter Robot (mms_params.yaml)
+
+| Parameter | Default | Deskripsi |
+|-----------|---------|-----------|
+| serial_port | /dev/ttyUSB0 | Port serial ESP32 |
+| wheel_radius | 0.05 | Radius roda (meter) |
+| robot_radius | 0.20 | Jarak pusat ke roda (meter) |
+| ticks_per_rev | 380 | Tick encoder per putaran |
+| watchdog_timeout_s | 0.5 | Timeout stop motor jika cmd_vel berhenti |
+
+## Parameter Sequencer (sequencer_params.yaml)
+
+| Parameter | Default | Deskripsi |
+|-----------|---------|-----------|
+| publish_rate_hz | 25.0 | Rate publish /cmd_vel saat RUNNING |
+| odom_max_age_ms | 500.0 | Batas umur odom sebelum stale → ERROR |
+| stop_hold_ticks | 10 | Tick publish 0 saat berhenti |
+| max_linear_speed | 1.0 | Batas kecepatan linear (m/s) |
+| max_angular_speed | 3.14 | Batas kecepatan angular (rad/s) |
+
+## Topic ROS
+
+| Topic | Tipe | Arah | Deskripsi |
+|-------|------|------|-----------|
+| /cmd_vel | geometry_msgs/Twist | Sub | Perintah kecepatan |
+| /odom | nav_msgs/Odometry | Pub | Posisi robot |
+| /mission/control | std_msgs/String | Sub | Kontrol misi (JSON) |
+| /mission/status | std_msgs/String | Pub | Status misi (JSON) |
+| /imu/data | sensor_msgs/Imu | Pub | Data IMU |
+| /encoder_ticks | std_msgs/Float32MultiArray | Pub | Debug encoder |
+
+## Service
+
+| Service | Tipe | Deskripsi |
+|---------|------|-----------|
+| /reset_odom | std_srvs/Empty | Reset posisi odometry ke (0,0,0) |
+
+## Troubleshooting
+
+### Cek node berjalan
+```bash
+ros2 node list
+```
+
+### Cek topic aktif
+```bash
+ros2 topic list
+ros2 topic info /cmd_vel
+```
+
+### Monitor feedback ESP32
+```bash
+ros2 topic echo /encoder_ticks
+ros2 topic echo /imu_raw
+```
+
+### Cek koneksi serial
+```bash
+ls /dev/ttyUSB*
+```
+
+### Reset odometry manual
 ```bash
 ros2 service call /reset_odom std_srvs/srv/Empty "{}"
 ```
 
-Catatan: publisher encoder/IMU memakai QoS `sensor_data` (lebih responsif, tidak menumpuk antrian).
-
-## Troubleshooting
-
-Jika robot tidak bergerak saat publish ke `/cmd_vel`, gunakan diagnostic tools berikut:
-
-### 1. Diagnostic Lengkap
-```bash
-# Terminal 1: Jalankan diagnostic
-python3 ~/robot_2026/diagnose_ros_communication.py
-
-# Terminal 2: Test publish
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist \
-  "{linear: {x: 0.1, y: 0.0, z: 0.0}, angular: {z: 0.0}}" --once
-```
-
-### 2. Verifikasi Kinematika
-```bash
-python3 ~/robot_2026/test_kinematics.py
-```
-
-### 3. Test Serial Langsung (Bypass ROS)
-```bash
-python3 ~/robot_2026/test_esp32_direct.py
-```
-
-### Quick Checks
-```bash
-# Cek node berjalan
-ros2 node list
-
-# Cek subscriber /cmd_vel
-ros2 topic info /cmd_vel
-
-# Monitor feedback dari ESP32
-ros2 topic echo /encoder_ticks
-ros2 topic echo /imu_raw
-
-# Cek device serial
-ls /dev/ttyUSB*
-```
+### Setup Foxglove panels
+Lihat panduan lengkap di [docs/FOXGLOVE_PANELS.md](docs/FOXGLOVE_PANELS.md) untuk:
+- Layout panel yang recommended
+- Konfigurasi 3D visualization, mission control, dan telemetry
+- Mission testing workflow
+- Troubleshooting common issues
