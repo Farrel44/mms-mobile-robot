@@ -20,3 +20,19 @@ mission_sequencer:
     # Batas safety output /cmd_vel (clamp)
     max_linear_speed: 1.0      # m/s
     max_angular_speed: 3.14    # rad/s
+
+    # ============================================================
+    # Input units for step table
+    # ============================================================
+    # Step X/Y are interpreted as cm/s, and W as deg/s.
+    # They will be converted to SI (m/s, rad/s) before publishing /cmd_vel.
+    input_linear_unit: cm
+    input_angular_unit: deg
+
+    # Exit DIST value unit (distance target)
+    # With 'cm': exit.val is in centimeters.
+    exit_dist_unit: cm
+
+    # Default linear speed for *_JARAK commands (in input_linear_unit per second)
+    # Example: 20 cm/s
+    default_linear_speed: 20.0

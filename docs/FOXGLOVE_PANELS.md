@@ -349,39 +349,39 @@ ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 
 ### Test 1: Basic Motion
 ```json
-{"cmd":"EXECUTE_RAW","steps":[{"cmd":"MAJU","x":0.1,"y":0,"w":0,"exit":{"mode":"TIME","op":">=","val":3000}}]}
+{"cmd":"EXECUTE_RAW","steps":[{"cmd":"MAJU","x":20,"y":0,"w":0,"exit":{"mode":"TIME","op":">=","val":3000}}]}
 {"cmd":"RUN"}
 ```
 **Expected:**
 - ✅ Mission status → RUNNING
 - ✅ 3D view: robot bergerak maju (X+)
-- ✅ Velocity plot: Vx = 0.1 m/s
+- ✅ Velocity plot: Vx = 0.2 m/s
 - ✅ Encoder ticks berubah
 
 ### Test 2: Rotation
 ```json
-{"cmd":"EXECUTE_RAW","steps":[{"cmd":"PUTAR_KIRI","x":0,"y":0,"w":0.5,"exit":{"mode":"ANGLE","op":">=","val":90}}]}
+{"cmd":"EXECUTE_RAW","steps":[{"cmd":"PUTAR_KIRI","x":0,"y":0,"w":45,"exit":{"mode":"ANGLE","op":">=","val":90}}]}
 {"cmd":"RUN"}
 ```
 **Expected:**
 - ✅ 3D view: robot rotate CCW 90°
-- ✅ Angular velocity plot: Wz = 0.5 rad/s
+- ✅ Angular velocity plot: Wz = 45 deg/s
 - ✅ Gyro_z di `/imu_raw` berubah
 - ✅ Mission DONE saat angle >= 90°
 
 ### Test 3: Multi-Step Sequence
 ```json
 {"cmd":"EXECUTE_RAW","steps":[
-  {"cmd":"MAJU","x":0.15,"y":0,"w":0,"exit":{"mode":"TIME","op":">=","val":2000}},
-  {"cmd":"PUTAR_KANAN","x":0,"y":0,"w":0.8,"exit":{"mode":"ANGLE","op":"<=","val":-90}},
-  {"cmd":"MUNDUR","x":0.15,"y":0,"w":0,"exit":{"mode":"DIST","op":">=","val":0.3}}
+  {"cmd":"MAJU","x":15,"y":0,"w":0,"exit":{"mode":"TIME","op":">=","val":2000}},
+  {"cmd":"PUTAR_KANAN","x":0,"y":0,"w":60,"exit":{"mode":"ANGLE","op":"<=","val":-90}},
+  {"cmd":"MUNDUR","x":15,"y":0,"w":0,"exit":{"mode":"DIST","op":">=","val":30}}
 ]}
 {"cmd":"RUN"}
 ```
 **Expected:**
 - ✅ Step 0 → MAJU 2 detik
 - ✅ Step 1 → PUTAR_KANAN sampai -90°
-- ✅ Step 2 → MUNDUR 0.3 meter
+- ✅ Step 2 → MUNDUR 30 cm
 - ✅ State → DONE
 
 ---
@@ -404,8 +404,15 @@ Buat `Text` panel atau `Image` panel dengan quick reference command dictionary:
 ```
 MAJU        → X=speed   Maju (+X)
 MUNDUR      → X=speed   Mundur (-X)
-KIRI        → Y=speed   Strafe kiri (+Y)
-KANAN       → Y=speed   Strafe kanan (-Y)
+KIRI        → Y=speed   Geser kiri (+Y)
+KANAN       → Y=speed   Geser kanan (-Y)
+STRAFE      → X/Y=speed Diagonal (X maju/mundur, Y kiri/kanan)
+STRAFE_MAJU_KIRI   → X=maju  Y=kiri (Y=0 → pakai X)
+STRAFE_MAJU_KANAN  → X=maju  Y=kanan (Y=0 → pakai X)
+STRAFE_MUNDUR_KIRI → X=mundur Y=kiri (Y=0 → pakai X)
+STRAFE_MUNDUR_KANAN→ X=mundur Y=kanan (Y=0 → pakai X)
+MAJU_JARAK  → X=jarak   Maju sampai DIST>=X (W optional=Speed)
+MUNDUR_JARAK→ X=jarak   Mundur sampai DIST>=X (W optional=Speed)
 PUTAR_KIRI  → W=speed   CCW (+)
 PUTAR_KANAN → W=speed   CW (-)
 BALANCE     → passthrough

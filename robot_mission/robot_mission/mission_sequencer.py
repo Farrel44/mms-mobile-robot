@@ -67,12 +67,70 @@ def _gen_mundur(x, y, w):
     return (-abs(x), 0.0, 0.0)
 
 def _gen_kiri(x, y, w):
-    """KIRI (strafe): Y = kecepatan lateral kiri (m/s). X,W tidak dipakai."""
+    """KIRI (geser): Y = kecepatan lateral kiri. X,W tidak dipakai."""
     return (0.0, abs(y), 0.0)
 
 def _gen_kanan(x, y, w):
-    """KANAN (strafe): Y = kecepatan lateral kanan (m/s). X,W tidak dipakai."""
+    """KANAN (geser): Y = kecepatan lateral kanan. X,W tidak dipakai."""
     return (0.0, -abs(y), 0.0)
+
+
+def _gen_strafe(x, y, w):
+    """STRAFE (diagonal): X = kecepatan maju/mundur, Y = kecepatan geser kiri/kanan.
+
+    - X positif: maju, X negatif: mundur
+    - Y positif: geser kiri, Y negatif: geser kanan
+    - W tidak dipakai (wz = 0)
+    """
+    return (float(x), float(y), 0.0)
+
+
+def _gen_strafe_maju_kiri(x, y, w):
+        """STRAFE_MAJU_KIRI: diagonal maju + geser kiri.
+
+        Input:
+            - X: besar speed maju (>=0)
+            - Y: besar speed geser kiri (>=0). Jika Y=0, akan disamakan dengan X.
+        """
+        vx = abs(float(x))
+        vy = abs(float(y)) if float(y) != 0.0 else vx
+        return (vx, vy, 0.0)
+
+
+def _gen_strafe_maju_kanan(x, y, w):
+        """STRAFE_MAJU_KANAN: diagonal maju + geser kanan.
+
+        Input:
+            - X: besar speed maju (>=0)
+            - Y: besar speed geser kanan (>=0). Jika Y=0, akan disamakan dengan X.
+        """
+        vx = abs(float(x))
+        vy = abs(float(y)) if float(y) != 0.0 else vx
+        return (vx, -vy, 0.0)
+
+
+def _gen_strafe_mundur_kiri(x, y, w):
+        """STRAFE_MUNDUR_KIRI: diagonal mundur + geser kiri.
+
+        Input:
+            - X: besar speed mundur (>=0)
+            - Y: besar speed geser kiri (>=0). Jika Y=0, akan disamakan dengan X.
+        """
+        vx = abs(float(x))
+        vy = abs(float(y)) if float(y) != 0.0 else vx
+        return (-vx, vy, 0.0)
+
+
+def _gen_strafe_mundur_kanan(x, y, w):
+        """STRAFE_MUNDUR_KANAN: diagonal mundur + geser kanan.
+
+        Input:
+            - X: besar speed mundur (>=0)
+            - Y: besar speed geser kanan (>=0). Jika Y=0, akan disamakan dengan X.
+        """
+        vx = abs(float(x))
+        vy = abs(float(y)) if float(y) != 0.0 else vx
+        return (-vx, -vy, 0.0)
 
 def _gen_putar_kiri(x, y, w):
     """PUTAR_KIRI: W = kecepatan angular CCW (rad/s). X,Y tidak dipakai."""
@@ -96,10 +154,21 @@ COMMAND_REGISTRY = {
     'MUNDUR':       _gen_mundur,
     'KIRI':         _gen_kiri,
     'KANAN':        _gen_kanan,
+    'GESER_KIRI':   _gen_kiri,
+    'GESER_KANAN':  _gen_kanan,
     'PUTAR_KIRI':   _gen_putar_kiri,
     'PUTAR_KANAN':  _gen_putar_kanan,
+    'STRAFE':       _gen_strafe,
+    'STRAFE_MAJU_KIRI':    _gen_strafe_maju_kiri,
+    'STRAFE_MAJU_KANAN':   _gen_strafe_maju_kanan,
+    'STRAFE_MUNDUR_KIRI':  _gen_strafe_mundur_kiri,
+    'STRAFE_MUNDUR_KANAN': _gen_strafe_mundur_kanan,
     'BALANCE':      _gen_balance,
     'STOP':         _gen_stop,
+
+    # Distance-intent commands (auto-exit by distance)
+    'MAJU_JARAK':   None,
+    'MUNDUR_JARAK': None,
 }
 
 
@@ -215,6 +284,17 @@ class MissionSequencer(Node):
         self.declare_parameter('max_linear_speed', 1.0)
         self.declare_parameter('max_angular_speed', 3.14)
 
+        # Unit handling (convert to SI before publishing /cmd_vel)
+        # - input_linear_unit: 'm' or 'cm'  (interprets step X/Y as m/s or cm/s)
+        # - input_angular_unit: 'rad' or 'deg' (interprets step W as rad/s or deg/s)
+        # - exit_dist_unit: 'm' or 'cm' (interprets exit DIST val)
+        self.declare_parameter('input_linear_unit', 'm')
+        self.declare_parameter('input_angular_unit', 'rad')
+        self.declare_parameter('exit_dist_unit', 'm')
+
+        # Default speeds for *_JARAK commands (in the chosen input units)
+        self.declare_parameter('default_linear_speed', 0.2)   # m/s (or 20 cm/s)
+
     def _load_params(self):
         self.publish_rate_hz = self.get_parameter(
             'publish_rate_hz').value or 25.0
@@ -228,6 +308,23 @@ class MissionSequencer(Node):
             'max_angular_speed').value or 3.14
         self.idle_keepalive_hz = self.get_parameter(
             'idle_keepalive_hz').value or 5.0
+
+        self.input_linear_unit = str(
+            self.get_parameter('input_linear_unit').value or 'm'
+        ).strip().lower()
+        self.input_angular_unit = str(
+            self.get_parameter('input_angular_unit').value or 'rad'
+        ).strip().lower()
+        self.exit_dist_unit = str(
+            self.get_parameter('exit_dist_unit').value or 'm'
+        ).strip().lower()
+
+        self.default_linear_speed = float(
+            self.get_parameter('default_linear_speed').value or 0.2
+        )
+
+        self._linear_scale_to_si = 0.01 if self.input_linear_unit == 'cm' else 1.0
+        self._angular_scale_to_si = (math.pi / 180.0) if self.input_angular_unit == 'deg' else 1.0
 
     # =================================================================
     # Callback /odom — update state pose dari driver
@@ -432,13 +529,27 @@ class MissionSequencer(Node):
             self.get_logger().error(self.warning)
             return False
 
-        cmd = step.get('cmd', '')
+        cmd = str(step.get('cmd', '') or '')
         if cmd not in COMMAND_REGISTRY:
             self.warning = f'Step [{index}]: CMD "{cmd}" tidak dikenal'
             self.state = STATE_ERROR
             self.error_reason = self.warning
             self.get_logger().error(self.warning)
             return False
+
+        # *_JARAK commands auto-generate an exit condition; exit field is optional.
+        if cmd in ('MAJU_JARAK', 'MUNDUR_JARAK'):
+            try:
+                dist = float(step.get('x', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                dist = 0.0
+            if dist <= 0.0:
+                self.warning = f'Step [{index}]: {cmd} butuh x>0 (jarak)'
+                self.state = STATE_ERROR
+                self.error_reason = self.warning
+                self.get_logger().error(self.warning)
+                return False
+            return True
 
         exit_cond = step.get('exit')
         if not isinstance(exit_cond, dict):
@@ -472,7 +583,14 @@ class MissionSequencer(Node):
     def _init_step_context(self, index):
         """Inisialisasi context untuk step baru (anchor waktu/pose)."""
         step = self.steps[index]
-        self.step_snapshot = dict(step)  # snapshot (lock)
+        snapshot = dict(step)  # snapshot (lock)
+
+        # Expand *_JARAK steps into a concrete speed command + auto DIST exit.
+        cmd = str(snapshot.get('cmd', '?') or '')
+        if cmd in ('MAJU_JARAK', 'MUNDUR_JARAK'):
+            snapshot = self._expand_jarak_step(snapshot)
+
+        self.step_snapshot = snapshot
         self.step_start_time_ns = self.get_clock().now().nanoseconds
 
         # Anchor odom untuk exit ANGLE/DIST
@@ -484,15 +602,56 @@ class MissionSequencer(Node):
         self.accumulated_yaw_deg = 0.0
 
         # Jika step adalah STOP, siapkan ramp-down halus dari output terakhir.
-        cmd = step.get('cmd', '?')
+        cmd = str(self.step_snapshot.get('cmd', '?') or '?')
         if cmd == 'STOP':
-            self._arm_stop_step_ramp(step)
+            self._arm_stop_step_ramp(self.step_snapshot)
 
-        exit_info = step.get('exit', {})
+        exit_info = self.step_snapshot.get('exit', {})
         self.get_logger().info(
             f'Step [{index}] mulai: CMD={cmd} '
             f'EXIT={exit_info.get("mode")} {exit_info.get("op")} '
             f'{exit_info.get("val")}')
+
+    def _expand_jarak_step(self, step):
+        """Expand MAJU_JARAK/MUNDUR_JARAK into a normal speed step with auto DIST exit.
+
+        Input convention:
+          - x: target distance (in exit_dist_unit)
+          - w: optional speed (in input_linear_unit per second). If w==0 -> default_linear_speed.
+        """
+        cmd = str(step.get('cmd', '') or '')
+        dist = float(step.get('x', 0.0) or 0.0)
+        try:
+            speed = float(step.get('w', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            speed = 0.0
+
+        dist = abs(dist)
+        if speed == 0.0:
+            speed = float(self.default_linear_speed)
+        speed = abs(speed)
+
+        expanded = dict(step)
+        # Translate into base command semantics (speed commands).
+        expanded['cmd'] = 'MAJU' if cmd == 'MAJU_JARAK' else 'MUNDUR'
+        expanded['x'] = speed
+        expanded['y'] = 0.0
+        expanded['w'] = 0.0
+
+        # Auto exit by distance.
+        expanded['exit'] = {
+            'mode': 'DIST',
+            'op': '>=',
+            'val': dist,
+        }
+
+        # Keep original intent as metadata for status/debug.
+        expanded['_intent'] = cmd
+        expanded['_target_dist'] = dist
+        expanded['_target_dist_unit'] = self.exit_dist_unit
+        expanded['_speed'] = speed
+        expanded['_speed_unit'] = self.input_linear_unit + '/s'
+        return expanded
 
     def _arm_stop_step_ramp(self, step):
         """Siapkan ramp-down untuk step STOP agar deselerasi halus.
@@ -597,13 +756,19 @@ class MissionSequencer(Node):
     # =================================================================
     def _interpret_step(self, step):
         """Translate CMD + X/Y/W → (vx, vy, wz) untuk /cmd_vel."""
-        cmd = step.get('cmd', 'STOP')
-        x = float(step.get('x', 0.0))
-        y = float(step.get('y', 0.0))
-        w = float(step.get('w', 0.0))
+        cmd = str(step.get('cmd', 'STOP') or 'STOP')
+        x = float(step.get('x', 0.0) or 0.0)
+        y = float(step.get('y', 0.0) or 0.0)
+        w = float(step.get('w', 0.0) or 0.0)
 
-        gen_fn = COMMAND_REGISTRY.get(cmd, _gen_stop)
-        return gen_fn(x, y, w)
+        gen_fn = COMMAND_REGISTRY.get(cmd) or _gen_stop
+        vx_u, vy_u, wz_u = gen_fn(x, y, w)
+
+        # Convert user units -> SI for /cmd_vel
+        vx = vx_u * self._linear_scale_to_si
+        vy = vy_u * self._linear_scale_to_si
+        wz = wz_u * self._angular_scale_to_si
+        return vx, vy, wz
 
     def _compute_step_cmd_vel(self, step):
         """Hitung output cmd_vel untuk step aktif.
@@ -667,10 +832,13 @@ class MissionSequencer(Node):
             return self.accumulated_yaw_deg
 
         elif mode == 'DIST':
-            # Jarak euclidean dari posisi start (meter)
+            # Jarak euclidean dari posisi start (meter), bisa diubah ke cm
             dx = self.odom_x - self.step_start_x
             dy = self.odom_y - self.step_start_y
-            return math.hypot(dx, dy)
+            dist_m = math.hypot(dx, dy)
+            if self.exit_dist_unit == 'cm':
+                return dist_m * 100.0
+            return dist_m
 
         return 0.0
 
