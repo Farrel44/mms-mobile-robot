@@ -1,11 +1,19 @@
 motor_bridge_node:
   ros__parameters:
-    # Serial
-    serial_port: /dev/ttyUSB0
+    # Serial — STM32 via Raspberry Pi UART (pin TX/RX)
+    # Gunakan /dev/serial0 (alias ke UART primer Pi).
+    # Pastikan:
+    #   1. Bluetooth sudah dipindah ke miniuart atau dinonaktifkan
+    #      (tambahkan dtoverlay=miniuart-bt di /boot/config.txt)
+    #   2. Serial console sudah dinonaktifkan:
+    #      sudo raspi-config -> Interface -> Serial Port
+    #      -> "login shell over serial" = No
+    #      -> "serial port hardware" = Yes
+    # Alternatif: /dev/ttyAMA0 (langsung ke PL011 UART)
+    serial_port: /dev/serial0
     serial_baudrate: 115200
     serial_timeout_s: 0.01
-    serial_boot_wait_s: 2.5
-    serial_mode_switch_wait_s: 0.5
+    serial_boot_wait_s: 0.5
     serial_sync_max_attempts: 2000
     # Set true only if you must force-clear garbage; may drop valid bytes.
     serial_reset_buffers_on_start: false

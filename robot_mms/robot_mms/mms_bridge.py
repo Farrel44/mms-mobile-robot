@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Node ROS2 untuk bridge /cmd_vel <-> ESP32 via protokol serial biner.
+Node ROS2 untuk bridge /cmd_vel <-> STM32 via protokol serial biner (UART).
 
 Alur utama:
   Command : /cmd_vel -> inverse kinematics -> RPM -> serial TX
   Feedback: serial RX -> forward kinematics -> odometry -> /odom + TF + /imu
+
+Koneksi:
+  Raspberry Pi UART (TX/RX) <-> STM32 USART2 (115200 baud, 8N1)
+  Port default: /dev/serial0 (pastikan Bluetooth sudah dipindah atau
+  dinonaktifkan agar UART0 bebas — lihat /boot/config.txt).
 """
 import rclpy
 from rclpy.node import Node
@@ -23,7 +28,7 @@ import threading
 
 from . import kinematics
 
-# Protokol serial (sesuai firmware ESP32)
+# Protokol serial (sesuai firmware STM32 — identik dengan ESP32)
 PACKET_HEADER = 0xA5
 CMD_PACKET_SIZE = 8       # header(1) + 3×int16(6) + xor(1)
 FEEDBACK_PACKET_SIZE = 18  # header(1) + 3×int32(12) + 2×int16(4) + xor(1)
@@ -73,14 +78,23 @@ class MotorBridge(Node):
         self.rx_buf = bytearray()
 
         # =============================================================
-        # Koneksi serial ke ESP32
+        # Koneksi serial ke STM32 via UART
         # =============================================================
         try:
             self.ser = serial.Serial(
                 self.serial_port,
                 self.serial_baudrate,
                 timeout=self.serial_timeout_s,
+                # UART-safe: nonaktifkan flow control & sinyal modem
+                # agar tidak mengganggu jalur TX/RX murni ke STM32.
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
             )
+            # Pastikan DTR/RTS tidak aktif (beberapa driver UART
+            # mengubah level pin ini saat port dibuka).
+            self.ser.dtr = False
+            self.ser.rts = False
             self._init_serial_connection()
             self.get_logger().info(
                 f'Serial terhubung: {self.serial_port} @ {self.serial_baudrate}'
@@ -102,12 +116,11 @@ class MotorBridge(Node):
 
     def _declare_all_parameters(self):
         """Deklarasi parameter dengan default value."""
-        # Serial
-        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        # Serial (STM32 via UART — default /dev/serial0)
+        self.declare_parameter('serial_port', '/dev/serial0')
         self.declare_parameter('serial_baudrate', 115200)
         self.declare_parameter('serial_timeout_s', 0.01)
-        self.declare_parameter('serial_boot_wait_s', 2.5)
-        self.declare_parameter('serial_mode_switch_wait_s', 0.5)
+        self.declare_parameter('serial_boot_wait_s', 0.5)
         self.declare_parameter('serial_sync_max_attempts', 2000)
         self.declare_parameter('serial_reset_buffers_on_start', False)
 
@@ -136,12 +149,11 @@ class MotorBridge(Node):
             val = self.get_parameter(name).value
             return conv(val) if val is not None else default
 
-        # Serial
-        self.serial_port = _get('serial_port', '/dev/ttyUSB0', str)
+        # Serial (STM32 via UART)
+        self.serial_port = _get('serial_port', '/dev/serial0', str)
         self.serial_baudrate = _get('serial_baudrate', 115200, int)
         self.serial_timeout_s = _get('serial_timeout_s', 0.01, float)
-        self.serial_boot_wait_s = _get('serial_boot_wait_s', 2.5, float)
-        self.serial_mode_switch_wait_s = _get('serial_mode_switch_wait_s', 0.5, float)
+        self.serial_boot_wait_s = _get('serial_boot_wait_s', 0.5, float)
         self.serial_sync_max_attempts = _get('serial_sync_max_attempts', 2000, int)
         self.serial_reset_buffers_on_start = _get('serial_reset_buffers_on_start', False, bool)
 
@@ -249,29 +261,33 @@ class MotorBridge(Node):
     # =================================================================
 
     def _init_serial_connection(self):
-        """Startup serial: tunggu boot ESP32 -> mode binary -> sync paket."""
-        self.get_logger().info('Inisialisasi serial...')
+        """Startup serial: tunggu boot STM32 -> sync paket feedback.
+
+        Berbeda dengan ESP32 (perlu kirim 'b' untuk masuk binary mode),
+        STM32 langsung beroperasi dalam mode biner sejak FreeRTOS boot.
+        Cukup tunggu sebentar lalu sinkronisasi ke stream feedback.
+        """
+        self.get_logger().info('Inisialisasi serial (STM32 UART)...')
 
         if self.serial_reset_buffers_on_start:
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
 
         if self.serial_boot_wait_s > 0.0:
+            self.get_logger().info(
+                f'Tunggu boot STM32 ({self.serial_boot_wait_s:.1f}s)...')
             time.sleep(self.serial_boot_wait_s)
 
-        # Masuk mode binary (sesuai firmware ESP32)
-        self.get_logger().info('Switch ke binary mode...')
-        self.ser.write(b'b')
-
-        if self.serial_mode_switch_wait_s > 0.0:
-            time.sleep(self.serial_mode_switch_wait_s)
+        # STM32 sudah dalam binary mode — langsung flush buffer
+        # untuk membuang data sisa saat boot.
+        self.ser.reset_input_buffer()
 
         # Sync: cari paket feedback valid pertama
-        self.get_logger().info('Sync ke stream feedback...')
+        self.get_logger().info('Sync ke stream feedback STM32...')
         if self._sync_to_packet(self.serial_sync_max_attempts):
             self.get_logger().info('Sync OK (paket valid ditemukan)')
         else:
-            self.get_logger().warn('Sync gagal (belum ada paket valid)')
+            self.get_logger().warn('Sync gagal (belum ada paket valid dari STM32)')
 
     def _sync_to_packet(self, max_attempts=1000):
         """Baca bytes sampai ketemu 1 feedback packet valid."""
@@ -370,10 +386,11 @@ class MotorBridge(Node):
         return packet + bytes([checksum])
 
     def parse_feedback_packet(self, packet):
-        """Parse feedback 18 byte dari ESP32.
+        """Parse feedback 18 byte dari STM32.
 
         Format: [0xA5, Tick1(4), Tick2(4), Tick3(4), GyroZ(2), AngleX(2), XOR]
-        ESP32 mengirim gyro & angle dikali 1000 (int16).
+        STM32 mengirim gyro_z & angle_x dikali 1000 (int16, milli-rad).
+        Protokol identik dengan versi ESP32 sebelumnya.
 
         Returns:
             (delta_ticks, gyro_z_rad_s, angle_x_rad) atau None jika gagal
@@ -403,7 +420,7 @@ class MotorBridge(Node):
     # =================================================================
 
     def cmd_vel_callback(self, msg):
-        """Terima cmd_vel, hitung RPM, kirim ke ESP32."""
+        """Terima cmd_vel, hitung RPM, kirim ke STM32."""
         self.last_cmd_stamp = self.get_clock().now()
         self.watchdog_triggered = False
 
@@ -427,7 +444,7 @@ class MotorBridge(Node):
         self.send_rpm_command(rpm1, rpm2, rpm3)
 
     def send_rpm_command(self, rpm1, rpm2, rpm3):
-        """Kirim paket RPM ke ESP32."""
+        """Kirim paket RPM ke STM32."""
         packet = self.build_command_packet(rpm1, rpm2, rpm3)
         try:
             self.ser.write(packet)
@@ -446,7 +463,7 @@ class MotorBridge(Node):
     # =================================================================
 
     def read_feedback_callback(self):
-        """Baca feedback dari ESP32, proses batch, publish."""
+        """Baca feedback dari STM32, proses batch, publish."""
         waiting = self.ser.in_waiting or 0
         if waiting <= 0:
             return
