@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Node ROS2 untuk bridge /cmd_vel <-> STM32 via protokol serial biner (UART).
+Node ROS2 untuk bridge /cmd_vel <-> STM32 via protokol serial biner (USB).
 
 Alur utama:
   Command : /cmd_vel -> inverse kinematics -> RPM -> serial TX
   Feedback: serial RX -> forward kinematics -> odometry -> /odom + TF + /imu
 
 Koneksi:
-  Raspberry Pi UART (TX/RX) <-> STM32 USART2 (115200 baud, 8N1)
-  Port default: /dev/serial0 (pastikan Bluetooth sudah dipindah atau
-  dinonaktifkan agar UART0 bebas — lihat /boot/config.txt).
+  Raspberry Pi USB <-> STM32 Nucleo ST-LINK VCP (115200 baud, 8N1)
+  Port default: /dev/ttyACM0 (ST-LINK VCP mem-bridge USART2 ke USB).
 """
 import rclpy
 from rclpy.node import Node

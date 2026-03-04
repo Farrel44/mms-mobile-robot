@@ -3,7 +3,7 @@
 <package format="3">
   <name>robot_mms</name>
   <version>0.0.1</version>
-  <description>MMS Motor Bridge for ESP32 communication</description>
+  <description>MMS Motor Bridge for STM32 UART communication</description>
   <maintainer email="robot@todo.todo">robot</maintainer>
   <license>Apache License 2.0</license>
 

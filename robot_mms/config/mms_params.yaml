@@ -1,16 +1,10 @@
 motor_bridge_node:
   ros__parameters:
-    # Serial — STM32 via Raspberry Pi UART (pin TX/RX)
-    # Gunakan /dev/serial0 (alias ke UART primer Pi).
-    # Pastikan:
-    #   1. Bluetooth sudah dipindah ke miniuart atau dinonaktifkan
-    #      (tambahkan dtoverlay=miniuart-bt di /boot/config.txt)
-    #   2. Serial console sudah dinonaktifkan:
-    #      sudo raspi-config -> Interface -> Serial Port
-    #      -> "login shell over serial" = No
-    #      -> "serial port hardware" = Yes
-    # Alternatif: /dev/ttyAMA0 (langsung ke PL011 UART)
-    serial_port: /dev/serial0
+    # Serial — STM32 Nucleo via USB (ST-LINK VCP)
+    # Nucleo F446RE onboard ST-LINK mem-bridge USART2 ke USB.
+    # Colok kabel USB dari Nucleo ke Raspberry Pi → muncul /dev/ttyACM0.
+    # Pastikan user masuk group dialout: sudo usermod -aG dialout $USER
+    serial_port: /dev/ttyACM0
     serial_baudrate: 115200
     serial_timeout_s: 0.01
     serial_boot_wait_s: 0.5
