@@ -22,7 +22,7 @@ import time
 # Protokol serial (identik dengan firmware STM32 & ESP32)
 # ---------------------------------------------------------------------------
 PACKET_HEADER = 0xA5
-FEEDBACK_SIZE = 18  # header(1) + 3×int32(12) + 2×int16(4) + xor(1)
+FEEDBACK_SIZE = 26  # header(1) + 3×int32(12) + 3×int16 gyro(6) + 3×int16 accel(6) + xor(1)
 
 
 def xor_checksum(data: bytes) -> int:
@@ -33,7 +33,7 @@ def xor_checksum(data: bytes) -> int:
 
 
 def parse_feedback(packet: bytes):
-    """Parse 18-byte feedback → (tick1, tick2, tick3, gyro_z, accel_z) or None."""
+    """Parse 26-byte feedback → (t1, t2, t3, gx, gy, gz, ax, ay, az) or None."""
     if len(packet) != FEEDBACK_SIZE:
         return None
     if packet[0] != PACKET_HEADER:
@@ -41,8 +41,9 @@ def parse_feedback(packet: bytes):
     if xor_checksum(packet[:-1]) != packet[-1]:
         return None
     ticks = struct.unpack('>iii', packet[1:13])
-    imu = struct.unpack('>hh', packet[13:17])
-    return ticks[0], ticks[1], ticks[2], imu[0], imu[1]
+    gyro = struct.unpack('>hhh', packet[13:19])
+    accel = struct.unpack('>hhh', packet[19:25])
+    return ticks[0], ticks[1], ticks[2], gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]
 
 
 def extract_packets(buf: bytearray) -> list:
@@ -113,7 +114,7 @@ def main():
                 if result is None:
                     continue
 
-                d1, d2, d3, _gz, _ax = result
+                d1, d2, d3, _gx, _gy, _gz, _ax, _ay, _az = result
                 total[0] += d1
                 total[1] += d2
                 total[2] += d3

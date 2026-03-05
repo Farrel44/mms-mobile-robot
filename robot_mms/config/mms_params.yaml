@@ -21,6 +21,24 @@ motor_bridge_node:
     # Safety
     watchdog_timeout_s: 0.5
 
+    # Velocity clamping (Rec 2: reject impossible commands)
+    # Max linear velocity the robot can physically achieve (m/s).
+    # Kiwi drive: max_rpm=600, wheel_radius=0.05 → v_max = 600*2π*0.05/60 ≈ 3.14 m/s
+    # Set conservatively below physical limit to avoid saturation.
+    max_linear_velocity: 2.0     # m/s
+    max_angular_velocity: 10.0   # rad/s
+
+    # Odometry covariance (Rec 1: dead-reckoning uncertainty growth)
+    # k_xy:    translational variance per meter traveled (m²/m)
+    # k_theta: rotational variance per radian rotated (rad²/rad)
+    # These are tuning parameters — increase if odom drifts significantly.
+    odom_k_xy: 0.01
+    odom_k_theta: 0.02
+
+    # Serial reconnect (Rec 4: auto-reconnect on USB disconnect)
+    # Interval in seconds between reconnect attempts when serial is down.
+    serial_reconnect_interval_s: 5.0
+
     # Frames
     odom_frame_id: odom
     base_frame_id: base_link

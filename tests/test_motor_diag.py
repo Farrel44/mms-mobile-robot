@@ -24,7 +24,7 @@ import time
 # ---------------------------------------------------------------------------
 PACKET_HEADER = 0xA5
 CMD_SIZE = 8
-FEEDBACK_SIZE = 18
+FEEDBACK_SIZE = 26
 TICKS_PER_REV = 380.0
 
 
@@ -62,12 +62,13 @@ def parse_feedback(packet: bytes):
     if packet[1] == PACKET_HEADER:
         return None
     ticks = struct.unpack('>iii', packet[1:13])
-    imu = struct.unpack('>hh', packet[13:17])
+    gyro = struct.unpack('>hhh', packet[13:19])
+    accel = struct.unpack('>hhh', packet[19:25])
     # Plausibility gate — physically impossible deltas indicate corruption.
     for t in ticks:
         if abs(t) > MAX_PLAUSIBLE_TICK_DELTA:
             return None
-    return ticks[0], ticks[1], ticks[2], imu[0], imu[1]
+    return ticks[0], ticks[1], ticks[2], gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]
 
 
 def extract_packets(buf: bytearray) -> list:
@@ -93,7 +94,7 @@ def extract_packets(buf: bytearray) -> list:
 
 def read_feedback_for(ser, duration_s, send_rpm=None, cmd_interval=0.02):
     """Read feedback for 'duration_s'.  Optionally send a command at cmd_interval.
-    Returns list of (time_rel, d1, d2, d3, gz, ax) tuples."""
+    Returns list of (time_rel, d1, d2, d3, gx, gy, gz, ax, ay, az) tuples."""
     buf = bytearray()
     results = []
     t0 = time.monotonic()
@@ -191,7 +192,7 @@ def main():
 
     # Check if any ticks are non-zero (from hand spinning or noise)
     total_ticks = [0, 0, 0]
-    for _, d1, d2, d3, _, _ in results:
+    for _, d1, d2, d3, _, _, _, _, _, _ in results:
         total_ticks[0] += abs(d1)
         total_ticks[1] += abs(d2)
         total_ticks[2] += abs(d3)
@@ -215,7 +216,7 @@ def main():
     results = read_feedback_for(ser, duration_s=5.0, send_rpm=[0, 0, 0])
 
     total_ticks = [0, 0, 0]
-    for _, d1, d2, d3, _, _ in results:
+    for _, d1, d2, d3, _, _, _, _, _, _ in results:
         total_ticks[0] += abs(d1)
         total_ticks[1] += abs(d2)
         total_ticks[2] += abs(d3)
@@ -273,7 +274,7 @@ def main():
         # Analyze ticks from motor 1
         total_abs = 0
         max_rpm_seen = 0.0
-        for _, d1, d2, d3, _, _ in results:
+        for _, d1, d2, d3, _, _, _, _, _, _ in results:
             total_abs += abs(d1)
             dt = 0.02  # approximate 50 Hz
             rpm = abs(d1) * 60.0 / (TICKS_PER_REV * dt) if dt > 0 else 0

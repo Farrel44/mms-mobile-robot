@@ -18,6 +18,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Empty
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from tf2_ros import TransformBroadcaster
 import serial
 import struct
@@ -30,7 +31,7 @@ from . import kinematics
 # Protokol serial (sesuai firmware STM32 — identik dengan ESP32)
 PACKET_HEADER = 0xA5
 CMD_PACKET_SIZE = 8       # header(1) + 3×int16(6) + xor(1)
-FEEDBACK_PACKET_SIZE = 18  # header(1) + 3×int32(12) + 2×int16(4) + xor(1)
+FEEDBACK_PACKET_SIZE = 26  # header(1) + 3×int32(12) + 3×int16 gyro(6) + 3×int16 accel(6) + xor(1)
 
 
 class MotorBridge(Node):
@@ -54,8 +55,12 @@ class MotorBridge(Node):
         # =============================================================
         self.feedback_lock = threading.Lock()
         self.encoder_ticks = [0, 0, 0]
+        self.gyro_x = 0.0
+        self.gyro_y = 0.0
         self.gyro_z = 0.0
-        self.angle_x_rad = 0.0
+        self.accel_x = 0.0
+        self.accel_y = 0.0
+        self.accel_z = 0.0
 
         # =============================================================
         # State odometry: pose (x, y, yaw) di frame odom
@@ -71,36 +76,29 @@ class MotorBridge(Node):
         self.last_wz = 0.0
         self.last_odom_stamp = None
 
+        # Odometry covariance accumulators (Rec 1)
+        self.total_distance = 0.0   # meters traveled (monotonic)
+        self.total_rotation = 0.0   # radians rotated (monotonic, absolute)
+
+        # =============================================================
+        # Diagnostic counters (Rec 6)
+        # =============================================================
+        self.serial_rx_count = 0          # valid feedback packets received
+        self.serial_checksum_errors = 0   # checksum failures
+        self.serial_rx_errors = 0         # serial read exceptions
+
         # =============================================================
         # Buffer RX serial (stream-safe, partial-packet handling)
         # =============================================================
         self.rx_buf = bytearray()
 
         # =============================================================
-        # Koneksi serial ke STM32 via UART
+        # Koneksi serial ke STM32 via UART (Rec 4: reconnect-safe)
         # =============================================================
-        try:
-            self.ser = serial.Serial(
-                self.serial_port,
-                self.serial_baudrate,
-                timeout=self.serial_timeout_s,
-                # UART-safe: nonaktifkan flow control & sinyal modem
-                # agar tidak mengganggu jalur TX/RX murni ke STM32.
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False,
-            )
-            # Pastikan DTR/RTS tidak aktif (beberapa driver UART
-            # mengubah level pin ini saat port dibuka).
-            self.ser.dtr = False
-            self.ser.rts = False
-            self._init_serial_connection()
-            self.get_logger().info(
-                f'Serial terhubung: {self.serial_port} @ {self.serial_baudrate}'
-            )
-        except Exception as e:
-            self.get_logger().error(f'Gagal koneksi serial: {e}')
-            raise SystemExit(1)
+        self.ser = None          # will be set by _open_serial()
+        self.serial_connected = False
+        self._serial_lock = threading.Lock()  # guards ser open/close
+        self._open_serial()      # best-effort; node starts even on failure
 
         # =============================================================
         # ROS subscribers, publishers, services, timers
@@ -125,12 +123,26 @@ class MotorBridge(Node):
 
         # Geometri robot
         self.declare_parameter('wheel_radius', 0.05)
-        self.declare_parameter('robot_radius', 0.10)
+        self.declare_parameter('robot_radius', 0.20)
         self.declare_parameter('ticks_per_rev', 380)
         self.declare_parameter('max_rpm', 600)
 
         # Safety
         self.declare_parameter('watchdog_timeout_s', 0.5)
+
+        # Velocity clamping (Rec 2: reject impossible commands)
+        self.declare_parameter('max_linear_velocity', 2.0)   # m/s
+        self.declare_parameter('max_angular_velocity', 10.0)  # rad/s
+
+        # Serial reconnect (Rec 4: auto-reconnect on USB disconnect)
+        self.declare_parameter('serial_reconnect_interval_s', 5.0)
+
+        # Odometry covariance scaling (Rec 1: dead-reckoning uncertainty)
+        # Covariance grows linearly with distance/rotation traveled.
+        # k_xy: translational variance per meter traveled (m²/m)
+        # k_theta: rotational variance per radian rotated (rad²/rad)
+        self.declare_parameter('odom_k_xy', 0.01)
+        self.declare_parameter('odom_k_theta', 0.02)
 
         # Frame & topic names
         self.declare_parameter('odom_frame_id', 'odom')
@@ -158,12 +170,24 @@ class MotorBridge(Node):
 
         # Geometri
         self.wheel_radius = _get('wheel_radius', 0.05, float)
-        self.robot_radius = _get('robot_radius', 0.10, float)
+        self.robot_radius = _get('robot_radius', 0.20, float)
         self.ticks_per_rev = _get('ticks_per_rev', 380, int)
         self.max_rpm = _get('max_rpm', 600, int)
 
         # Safety
         self.watchdog_timeout = _get('watchdog_timeout_s', 0.5, float)
+
+        # Velocity clamping
+        self.max_linear_velocity = _get('max_linear_velocity', 2.0, float)
+        self.max_angular_velocity = _get('max_angular_velocity', 10.0, float)
+
+        # Serial reconnect
+        self.serial_reconnect_interval_s = _get(
+            'serial_reconnect_interval_s', 5.0, float)
+
+        # Odometry covariance
+        self.odom_k_xy = _get('odom_k_xy', 0.01, float)
+        self.odom_k_theta = _get('odom_k_theta', 0.02, float)
 
         # Frame
         self.odom_frame_id = _get('odom_frame_id', 'odom', str)
@@ -204,9 +228,19 @@ class MotorBridge(Node):
         self.create_timer(0.02, self.read_feedback_callback)
         self.create_timer(0.1, self.watchdog_callback)
 
+        # Rec 4: Serial health check & auto-reconnect timer
+        self.create_timer(
+            self.serial_reconnect_interval_s,
+            self._serial_health_check)
+
         # Timer: publish pose/TF periodik agar frame odom selalu ada
         # (Foxglove/RViz butuh /tf untuk menampilkan daftar fixed frame)
         self.create_timer(0.1, self.publish_pose_callback)
+
+        # Rec 6: Diagnostic publisher (1 Hz)
+        self.diag_pub = self.create_publisher(
+            DiagnosticArray, '/diagnostics', 10)
+        self.create_timer(1.0, self._publish_diagnostics)
         
     
     def publish_pose_callback(self):
@@ -239,6 +273,10 @@ class MotorBridge(Node):
         odom.pose.pose.position.y = y
         odom.pose.pose.orientation.z = sin_half
         odom.pose.pose.orientation.w = cos_half
+
+        # Rec 1: Odometry covariance — grows with distance/rotation
+        self._fill_odom_covariance(odom)
+
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = wz
@@ -256,8 +294,65 @@ class MotorBridge(Node):
         self.tf_broadcaster.sendTransform(tf)
 
     # =================================================================
-    # Serial I/O (Transport Layer)
+    # Serial I/O (Transport Layer) — Rec 4: reconnect-safe
     # =================================================================
+
+    def _open_serial(self):
+        """Best-effort serial open.  Sets self.serial_connected on success.
+
+        Thread-safe: acquires _serial_lock.  Called from __init__
+        and _serial_health_check.
+        """
+        with self._serial_lock:
+            # Close stale handle, if any
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                self.serial_connected = False
+
+            try:
+                self.ser = serial.Serial(
+                    self.serial_port,
+                    self.serial_baudrate,
+                    timeout=self.serial_timeout_s,
+                    xonxoff=False,
+                    rtscts=False,
+                    dsrdtr=False,
+                )
+                self.ser.dtr = False
+                self.ser.rts = False
+                self._init_serial_connection()
+                self.serial_connected = True
+                self.get_logger().info(
+                    f'Serial terhubung: {self.serial_port} '
+                    f'@ {self.serial_baudrate}')
+            except Exception as e:
+                self.get_logger().error(f'Gagal koneksi serial: {e}')
+                self.ser = None
+                self.serial_connected = False
+
+    def _serial_health_check(self):
+        """Periodic reconnect timer callback (Rec 4).
+
+        If serial is disconnected, attempt to re-open.
+        If already connected, this is a no-op.
+        """
+        if self.serial_connected:
+            return
+        self.get_logger().warn(
+            'Serial terputus — mencoba reconnect…')
+        self._open_serial()
+
+    def _mark_serial_disconnected(self, exc):
+        """Handle serial failure: mark disconnected, log once."""
+        if self.serial_connected:
+            self.get_logger().error(
+                f'Serial terputus: {exc}  — auto-reconnect aktif')
+        self.serial_connected = False
+        # Don't close here; _open_serial will close+reopen on next attempt.
 
     def _init_serial_connection(self):
         """Startup serial: tunggu boot STM32 -> sync paket feedback.
@@ -348,6 +443,7 @@ class MotorBridge(Node):
                 del self.rx_buf[:FEEDBACK_PACKET_SIZE]
             else:
                 # Checksum gagal: buang 1 byte dan resync
+                self.serial_checksum_errors += 1
                 del self.rx_buf[:1]
 
         return packets
@@ -385,14 +481,25 @@ class MotorBridge(Node):
         return packet + bytes([checksum])
 
     def parse_feedback_packet(self, packet):
-        """Parse feedback 18 byte dari STM32.
+        """Parse feedback 26 byte dari STM32.
 
-        Format: [0xA5, Tick1(4), Tick2(4), Tick3(4), GyroZ(2), AngleX(2), XOR]
-        STM32 mengirim gyro_z & angle_x dikali 1000 (int16, milli-rad).
-        Protokol identik dengan versi ESP32 sebelumnya.
+        Format: [0xA5, T1(4), T2(4), T3(4), GX(2), GY(2), GZ(2),
+                 AX(2), AY(2), AZ(2), XOR]
+        STM32 mengirim milli-unit int16 (×1000) for gyro (rad/s)
+        and accel (m/s²).
+
+        Rec 5 — Encoder overflow note:
+        STM32 sends delta ticks (accumulated over one 50 Hz TX cycle,
+        then reset to 0).  At max speed (600 RPM motor), deltas are:
+          per 20 ms cycle: 3800 ticks/s × 0.02 s = 76 ticks.
+        The ticks are transmitted as int32 (±2.1 billion).  Overflow
+        would require 2.1e9 / 3800 ≈ 565 000 seconds ≈ 6.5 days of
+        continuous max-speed rotation — not a concern for competition
+        use (< 24 h runtime).
 
         Returns:
-            (delta_ticks, gyro_z_rad_s, angle_x_rad) atau None jika gagal
+            (delta_ticks, (gx, gy, gz), (ax, ay, az)) atau None jika gagal.
+            gyro in rad/s, accel in m/s².
         """
         if len(packet) != FEEDBACK_PACKET_SIZE:
             return None
@@ -404,12 +511,13 @@ class MotorBridge(Node):
 
         try:
             ticks = struct.unpack('>iii', packet[1:13])
-            imu_raw = struct.unpack('>hh', packet[13:17])
+            gyro_raw = struct.unpack('>hhh', packet[13:19])
+            accel_raw = struct.unpack('>hhh', packet[19:25])
 
-            gyro_z = imu_raw[0] / 1000.0      # rad/s
-            angle_x_rad = imu_raw[1] / 1000.0  # rad
+            gyro = tuple(v / 1000.0 for v in gyro_raw)    # rad/s
+            accel = tuple(v / 1000.0 for v in accel_raw)   # m/s²
 
-            return list(ticks), gyro_z, angle_x_rad
+            return list(ticks), gyro, accel
         except struct.error as e:
             self.get_logger().error(f'Error unpack feedback: {e}')
             return None
@@ -427,7 +535,18 @@ class MotorBridge(Node):
         vy = msg.linear.y
         wz = msg.angular.z
 
-        self.get_logger().info(
+        # Rec 2: Reject NaN/Inf — safety-critical guard
+        if not (math.isfinite(vx) and math.isfinite(vy) and math.isfinite(wz)):
+            self.get_logger().warn(
+                f'cmd_vel rejected: non-finite values vx={vx} vy={vy} wz={wz}')
+            return
+
+        # Rec 2: Clamp velocities to physical limits
+        vx = max(-self.max_linear_velocity, min(self.max_linear_velocity, vx))
+        vy = max(-self.max_linear_velocity, min(self.max_linear_velocity, vy))
+        wz = max(-self.max_angular_velocity, min(self.max_angular_velocity, wz))
+
+        self.get_logger().debug(
             f'cmd_vel: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}')
 
         # Inverse kinematics: cmd_vel -> kecepatan roda -> RPM
@@ -437,20 +556,28 @@ class MotorBridge(Node):
         rpm2 = kinematics.velocity_to_rpm(v2, self.wheel_radius)
         rpm3 = kinematics.velocity_to_rpm(v3, self.wheel_radius)
 
-        self.get_logger().info(
+        # Warn if any wheel RPM hits saturation limit
+        for i, rpm in enumerate([rpm1, rpm2, rpm3], 1):
+            if abs(rpm) > self.max_rpm:
+                self.get_logger().warn(
+                    f'Motor {i} RPM {rpm:.1f} exceeds ±{self.max_rpm}, will be clamped')
+
+        self.get_logger().debug(
             f'Wheel vel: v1={v1:.3f} v2={v2:.3f} v3={v3:.3f} m/s')
 
         self.send_rpm_command(rpm1, rpm2, rpm3)
 
     def send_rpm_command(self, rpm1, rpm2, rpm3):
-        """Kirim paket RPM ke STM32."""
+        """Kirim paket RPM ke STM32 (Rec 4: reconnect-safe)."""
+        if not self.serial_connected or self.ser is None:
+            return
         packet = self.build_command_packet(rpm1, rpm2, rpm3)
         try:
             self.ser.write(packet)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'TX RPM: M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
         except Exception as e:
-            self.get_logger().error(f'Error tulis serial: {e}')
+            self._mark_serial_disconnected(e)
 
     def send_stop_command(self):
         """Kirim RPM=0 ke semua motor."""
@@ -462,12 +589,18 @@ class MotorBridge(Node):
     # =================================================================
 
     def read_feedback_callback(self):
-        """Baca feedback dari STM32, proses batch, publish."""
-        waiting = self.ser.in_waiting or 0
-        if waiting <= 0:
+        """Baca feedback dari STM32, proses batch, publish (Rec 4: reconnect-safe)."""
+        if not self.serial_connected or self.ser is None:
             return
-
-        chunk = self.ser.read(int(waiting))
+        try:
+            waiting = self.ser.in_waiting or 0
+            if waiting <= 0:
+                return
+            chunk = self.ser.read(int(waiting))
+        except Exception as e:
+            self.serial_rx_errors += 1  # Rec 6: count read exceptions
+            self._mark_serial_disconnected(e)
+            return
         self._feed_rx(chunk)
 
         packets = self._extract_feedback_packets()
@@ -480,6 +613,7 @@ class MotorBridge(Node):
             result = self.parse_feedback_packet(pkt)
             if result is not None:
                 samples.append(result)
+                self.serial_rx_count += 1  # Rec 6: count valid packets
 
         if not samples:
             return
@@ -502,10 +636,10 @@ class MotorBridge(Node):
         """
         with self.feedback_lock:
             # Simpan data sample terakhir untuk debug publisher
-            ticks_last, gyro_z_last, angle_x_last = samples[-1]
+            ticks_last, gyro_last, accel_last = samples[-1]
             self.encoder_ticks = ticks_last
-            self.gyro_z = gyro_z_last
-            self.angle_x_rad = angle_x_last
+            self.gyro_x, self.gyro_y, self.gyro_z = gyro_last
+            self.accel_x, self.accel_y, self.accel_z = accel_last
 
             # Belum ada stamp sebelumnya -> simpan dan skip integrasi
             if self.last_feedback_stamp is None:
@@ -528,7 +662,7 @@ class MotorBridge(Node):
             vy_body = 0.0
             wz_gyro = 0.0
 
-            for ticks, gyro_z, _angle_x in samples:
+            for ticks, (_, _, gyro_z), _accel in samples:
                 # Forward kinematics: delta ticks -> twist body
                 vx, vy, _wz_enc = kinematics.delta_ticks_to_body_twist(
                     ticks,
@@ -559,6 +693,17 @@ class MotorBridge(Node):
                 vy_body = vy
                 wz_gyro = gyro_z
 
+                # Rec 1: accumulate distance/rotation for covariance growth
+                ds = math.hypot(dx_body, dy_body)
+                self.total_distance += ds
+                self.total_rotation += abs(delta_yaw)
+
+            # Normalize yaw to [-π, π] to prevent unbounded growth
+            while self.yaw > math.pi:
+                self.yaw -= 2.0 * math.pi
+            while self.yaw < -math.pi:
+                self.yaw += 2.0 * math.pi
+
             self.last_vx = vx_body
             self.last_vy = vy_body
             self.last_wz = wz_gyro
@@ -573,8 +718,12 @@ class MotorBridge(Node):
         # Ambil snapshot state (thread-safe)
         with self.feedback_lock:
             ticks = list(self.encoder_ticks)
-            gyro_z = self.gyro_z
-            angle_x_rad = self.angle_x_rad
+            gx = self.gyro_x
+            gy = self.gyro_y
+            gz = self.gyro_z
+            ax = self.accel_x
+            ay = self.accel_y
+            az = self.accel_z
             x = self.x
             y = self.y
             yaw = self.yaw
@@ -589,19 +738,33 @@ class MotorBridge(Node):
         enc_msg.data = [float(t) for t in ticks]
         self.encoder_pub.publish(enc_msg)
 
-        # --- Debug: IMU raw ---
+        # --- Debug: IMU raw (6 values: gx, gy, gz, ax, ay, az) ---
         imu_raw_msg = Float32MultiArray()
-        imu_raw_msg.data = [gyro_z, angle_x_rad]
+        imu_raw_msg.data = [gx, gy, gz, ax, ay, az]
         self.imu_raw_pub.publish(imu_raw_msg)
 
-        # --- IMU standar ---
+        # --- IMU standar (sensor_msgs/Imu) ---
         imu_msg = Imu()
         imu_msg.header.stamp = stamp_msg
         imu_msg.header.frame_id = self.base_frame_id
-        imu_msg.angular_velocity.z = gyro_z
-        # Orientation & linear accel belum tersedia
+
+        imu_msg.angular_velocity.x = gx
+        imu_msg.angular_velocity.y = gy
+        imu_msg.angular_velocity.z = gz
+
+        imu_msg.linear_acceleration.x = ax
+        imu_msg.linear_acceleration.y = ay
+        imu_msg.linear_acceleration.z = az
+
+        # Orientation not estimated on-board — mark unknown (REP-145)
         imu_msg.orientation_covariance[0] = -1.0
-        imu_msg.linear_acceleration_covariance[0] = -1.0
+        # Diagonal covariance for gyro (rad/s)² and accel (m/s²)²
+        imu_msg.angular_velocity_covariance[0] = 0.01
+        imu_msg.angular_velocity_covariance[4] = 0.01
+        imu_msg.angular_velocity_covariance[8] = 0.01
+        imu_msg.linear_acceleration_covariance[0] = 0.1
+        imu_msg.linear_acceleration_covariance[4] = 0.1
+        imu_msg.linear_acceleration_covariance[8] = 0.1
         self.imu_data_pub.publish(imu_msg)
 
         # --- Odometry ---
@@ -618,6 +781,9 @@ class MotorBridge(Node):
         odom.pose.pose.position.y = y
         odom.pose.pose.orientation.z = sin_half
         odom.pose.pose.orientation.w = cos_half
+
+        # Rec 1: Odometry covariance — grows with distance/rotation
+        self._fill_odom_covariance(odom)
 
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
@@ -636,6 +802,116 @@ class MotorBridge(Node):
         tf.transform.rotation.w = cos_half
         self.tf_broadcaster.sendTransform(tf)
 
+    def _fill_odom_covariance(self, odom):
+        """Populate odometry covariance matrices (Rec 1).
+
+        Dead-reckoning covariance grows linearly with distance/rotation
+        traveled. This gives downstream consumers (robot_localization,
+        nav2) a realistic uncertainty estimate.
+
+        Pose covariance: 6×6 row-major
+          [0]  = σ²_x  = k_xy * total_distance  (minimum 1e-4)
+          [7]  = σ²_y  = k_xy * total_distance
+          [35] = σ²_θ  = k_theta * total_rotation
+
+        Twist covariance: 6×6 row-major (instantaneous, constant)
+          [0]  = σ²_vx  = k_xy * 0.1  (nominal noise floor)
+          [7]  = σ²_vy  = k_xy * 0.1
+          [35] = σ²_wz  = k_theta * 0.1
+        """
+        # Pose covariance grows with travel (dead-reckoning drift)
+        cov_xy = max(self.odom_k_xy * self.total_distance, 1e-4)
+        cov_theta = max(self.odom_k_theta * self.total_rotation, 1e-4)
+
+        odom.pose.covariance[0] = cov_xy       # x-x
+        odom.pose.covariance[7] = cov_xy       # y-y
+        odom.pose.covariance[35] = cov_theta   # θ-θ
+
+        # Twist covariance: constant noise floor (instantaneous measurement)
+        odom.twist.covariance[0] = self.odom_k_xy * 0.1    # vx
+        odom.twist.covariance[7] = self.odom_k_xy * 0.1    # vy
+        odom.twist.covariance[35] = self.odom_k_theta * 0.1  # wz
+
+    # =================================================================
+    # Rec 6: Diagnostic Publisher
+    # =================================================================
+
+    def _publish_diagnostics(self):
+        """Publish /diagnostics at 1 Hz with serial, odometry, and watchdog health."""
+        msg = DiagnosticArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        # --- Serial Health ---
+        serial_status = DiagnosticStatus()
+        serial_status.name = 'motor_bridge: Serial Health'
+        serial_status.hardware_id = 'STM32_UART'
+        if self.serial_connected:
+            serial_status.level = DiagnosticStatus.OK
+            serial_status.message = 'Connected'
+        else:
+            serial_status.level = DiagnosticStatus.ERROR
+            serial_status.message = 'Disconnected'
+        serial_status.values = [
+            KeyValue(key='rx_packets', value=str(self.serial_rx_count)),
+            KeyValue(key='checksum_errors', value=str(self.serial_checksum_errors)),
+            KeyValue(key='rx_errors', value=str(self.serial_rx_errors)),
+            KeyValue(key='port', value=self.serial_port),
+        ]
+        msg.status.append(serial_status)
+
+        # --- Odometry Health ---
+        odom_status = DiagnosticStatus()
+        odom_status.name = 'motor_bridge: Odometry Health'
+        odom_status.hardware_id = 'odometry'
+        with self.feedback_lock:
+            has_feedback = self.last_feedback_stamp is not None
+            if has_feedback:
+                odom_age = (
+                    self.get_clock().now() - self.last_feedback_stamp
+                ).nanoseconds / 1e9
+            else:
+                odom_age = float('inf')
+            total_dist = self.total_distance
+            total_rot = self.total_rotation
+
+        if not has_feedback:
+            odom_status.level = DiagnosticStatus.WARN
+            odom_status.message = 'No feedback received yet'
+        elif odom_age > 0.5:
+            odom_status.level = DiagnosticStatus.WARN
+            odom_status.message = f'Stale feedback ({odom_age:.2f}s ago)'
+        else:
+            odom_status.level = DiagnosticStatus.OK
+            odom_status.message = 'OK'
+        odom_status.values = [
+            KeyValue(key='feedback_age_s', value=f'{odom_age:.3f}'),
+            KeyValue(key='total_distance_m', value=f'{total_dist:.3f}'),
+            KeyValue(key='total_rotation_rad', value=f'{total_rot:.3f}'),
+        ]
+        msg.status.append(odom_status)
+
+        # --- cmd_vel Watchdog ---
+        wd_status = DiagnosticStatus()
+        wd_status.name = 'motor_bridge: cmd_vel Watchdog'
+        wd_status.hardware_id = 'watchdog'
+        cmd_age = (
+            self.get_clock().now() - self.last_cmd_stamp
+        ).nanoseconds / 1e9
+        if self.watchdog_triggered:
+            wd_status.level = DiagnosticStatus.WARN
+            wd_status.message = f'Triggered — motors stopped ({cmd_age:.1f}s ago)'
+        else:
+            wd_status.level = DiagnosticStatus.OK
+            wd_status.message = 'Active'
+        wd_status.values = [
+            KeyValue(key='cmd_vel_age_s', value=f'{cmd_age:.3f}'),
+            KeyValue(key='watchdog_triggered', value=str(self.watchdog_triggered)),
+            KeyValue(key='timeout_s', value=str(self.watchdog_timeout)),
+        ]
+        msg.status.append(wd_status)
+
+        self.diag_pub.publish(msg)
+
     # =================================================================
     # Service: Reset Odometry
     # =================================================================
@@ -650,6 +926,9 @@ class MotorBridge(Node):
             self.last_vx = 0.0
             self.last_vy = 0.0
             self.last_wz = 0.0
+            # Rec 1: Reset covariance accumulators
+            self.total_distance = 0.0
+            self.total_rotation = 0.0
         self.get_logger().info('Odom di-reset: x=0 y=0 yaw=0')
         return response
 
