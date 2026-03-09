@@ -161,7 +161,7 @@ class MotorBridge(Node):
             return conv(val) if val is not None else default
 
         # Serial (STM32 via UART)
-        self.serial_port = _get('serial_port', '/dev/serial0', str)
+        self.serial_port = _get('serial_port', '/dev/ttyACM0', str)
         self.serial_baudrate = _get('serial_baudrate', 115200, int)
         self.serial_timeout_s = _get('serial_timeout_s', 0.01, float)
         self.serial_boot_wait_s = _get('serial_boot_wait_s', 0.5, float)

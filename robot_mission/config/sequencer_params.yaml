@@ -36,3 +36,17 @@ mission_sequencer:
     # Default linear speed for *_JARAK commands (in input_linear_unit per second)
     # Example: 20 cm/s
     default_linear_speed: 20.0
+
+    # ============================================================
+    # Motion Primitives (distance-based moves)
+    # ============================================================
+    motion:
+      position_tolerance_m: 0.02        # ±20mm displacement tolerance
+      angle_tolerance_deg: 2.0          # ±2° rotation tolerance
+      default_linear_speed_m_s: 0.10    # default move speed (m/s)
+      default_angular_speed_rad_s: 0.30 # default rotation speed (rad/s)
+      max_linear_speed_m_s: 0.20        # upper clamp for linear moves
+      ramp_accel_m_s2: 0.20             # trapezoidal acceleration (m/s²)
+      ramp_decel_dist_m: 0.05           # start decel this far from target (m)
+      move_timeout_s: 10.0              # timeout per primitive (s)
+      cmd_vel_rate_hz: 20.0             # publish rate during move (Hz)
