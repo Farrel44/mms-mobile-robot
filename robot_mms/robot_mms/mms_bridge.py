@@ -113,8 +113,8 @@ class MotorBridge(Node):
 
     def _declare_all_parameters(self):
         """Deklarasi parameter dengan default value."""
-        # Serial (STM32 via UART — default /dev/serial0)
-        self.declare_parameter('serial_port', '/dev/serial0')
+        # Serial (STM32 via UART — ST-LINK VCP)
+        self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('serial_baudrate', 115200)
         self.declare_parameter('serial_timeout_s', 0.01)
         self.declare_parameter('serial_boot_wait_s', 0.5)

@@ -20,12 +20,14 @@ TWO_PI = 2.0 * math.pi
 # =====================================================================
 
 def cmd_vel_to_wheel_velocities(vx, vy, wz, robot_radius):
-    """Hitung kecepatan linear tiap roda dari cmd_vel.
+    """Hitung kecepatan linear tiap roda dari cmd_vel (inverse kinematics).
 
-    Kiwi drive 3 roda di 120°:
-      v1 = -0.5*vx - (√3/2)*vy + L*wz
-      v2 = -0.5*vx + (√3/2)*vy + L*wz
-      v3 =      vx              + L*wz
+    Kiwi drive 3 roda, sudut motor (CCW, 0°=depan):
+      M1 = 180°:  v1 =               -vy + L*wz
+      M2 = 300°:  v2 =  (√3/2)*vx + 0.5*vy + L*wz
+      M3 = 60°:   v3 = -(√3/2)*vx + 0.5*vy + L*wz
+
+    Rumus umum: v = -sin(α)*vx + cos(α)*vy + L*wz
 
     Args:
         vx: kecepatan linear x (m/s), positif = maju
@@ -34,13 +36,13 @@ def cmd_vel_to_wheel_velocities(vx, vy, wz, robot_radius):
         robot_radius: jarak pusat robot ke roda (m)
 
     Returns:
-        (v1, v2, v3) dalam m/s
+        (v1, v2, v3) dalam m/s — sesuai urutan Motor 1, 2, 3
     """
     rotasi = robot_radius * wz
 
-    v1 = -0.5 * vx - SQRT3_OVER_2 * vy + rotasi
-    v2 = -0.5 * vx + SQRT3_OVER_2 * vy + rotasi
-    v3 = vx + rotasi
+    v1 = -vy + rotasi
+    v2 = SQRT3_OVER_2 * vx + 0.5 * vy + rotasi
+    v3 = -SQRT3_OVER_2 * vx + 0.5 * vy + rotasi
 
     return v1, v2, v3
 
@@ -92,10 +94,10 @@ def delta_ticks_to_wheel_velocities(delta_ticks, ticks_per_rev, wheel_radius, dt
 def wheel_velocities_to_body_twist(v1, v2, v3, robot_radius):
     """Forward kinematics: kecepatan roda -> twist di frame body.
 
-    Kebalikan dari inverse kinematics kiwi 3 roda:
+    Kebalikan dari inverse kinematics untuk M1=180°, M2=300°, M3=60°:
       wz  = (v1 + v2 + v3) / (3*L)
-      vx  = v3 - L*wz
-      vy  = (v2 - v1) / (2 * √3/2)
+      vx  = (v2 - v3) / √3
+      vy  = (v2 + v3 - 2*v1) / 3
 
     Args:
         v1, v2, v3: kecepatan linear roda (m/s)
@@ -109,8 +111,8 @@ def wheel_velocities_to_body_twist(v1, v2, v3, robot_radius):
         return 0.0, 0.0, 0.0
 
     wz_enc = (v1 + v2 + v3) / (3.0 * L)
-    vx = v3 - L * wz_enc
-    vy = (v2 - v1) / (2.0 * SQRT3_OVER_2)
+    vx = (v2 - v3) / (2.0 * SQRT3_OVER_2)
+    vy = (v2 + v3 - 2.0 * v1) / 3.0
 
     return vx, vy, wz_enc
 
