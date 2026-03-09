@@ -27,6 +27,9 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
+# ADDED(phase1-task1.5): import motion primitives helper
+from .motion_primitives import MotionPrimitives
+
 
 # =====================================================================
 # Konstanta state sequencer
@@ -169,6 +172,7 @@ COMMAND_REGISTRY = {
     # Distance-intent commands (auto-exit by distance)
     'MAJU_JARAK':   None,
     'MUNDUR_JARAK': None,
+    'MOVE_D1':      None,       # ADDED(phase1-task1.5): handled via primitives
 }
 
 
@@ -260,6 +264,21 @@ class MissionSequencer(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.status_pub = self.create_publisher(String, '/mission/status', 10)
 
+        # ADDED(phase1-task1.5): Load motion params dari YAML section 'motion'
+        ros_params = self.get_parameters_by_prefix('motion')
+        motion_params = {
+            k: v.value
+            for k, v in ros_params.items()
+        }
+
+        # ADDED(phase1-task1.5): Inisialisasi motion primitives helper
+        self.primitives = MotionPrimitives(
+            node=self,
+            cmd_vel_pub=self.cmd_vel_pub,
+            params=motion_params,
+        )
+        self.get_logger().info('MotionPrimitives initialized')
+
         # Timer eksekusi (publish /cmd_vel + evaluasi exit)
         timer_period = 1.0 / self.publish_rate_hz
         self.exec_timer = self.create_timer(timer_period, self._tick)
@@ -294,6 +313,17 @@ class MissionSequencer(Node):
 
         # Default speeds for *_JARAK commands (in the chosen input units)
         self.declare_parameter('default_linear_speed', 0.2)   # m/s (or 20 cm/s)
+
+        # ADDED(phase1-task1.5): Motion primitive parameters (from YAML section 'motion')
+        self.declare_parameter('motion.position_tolerance_m', 0.02)
+        self.declare_parameter('motion.angle_tolerance_deg', 2.0)
+        self.declare_parameter('motion.default_linear_speed_m_s', 0.10)
+        self.declare_parameter('motion.default_angular_speed_rad_s', 0.30)
+        self.declare_parameter('motion.max_linear_speed_m_s', 0.20)
+        self.declare_parameter('motion.ramp_accel_m_s2', 0.20)
+        self.declare_parameter('motion.ramp_decel_dist_m', 0.05)
+        self.declare_parameter('motion.move_timeout_s', 10.0)
+        self.declare_parameter('motion.cmd_vel_rate_hz', 20.0)
 
     def _load_params(self):
         self.publish_rate_hz = self.get_parameter(
@@ -354,6 +384,9 @@ class MissionSequencer(Node):
         self.odom_last_stamp_ns = self.get_clock().now().nanoseconds
         self.odom_received = True
 
+        # ADDED(phase1-task1.5): forward odom ke motion primitives
+        self.primitives.update_odom(msg)
+
     # =================================================================
     # Callback /mission/control — parse JSON command dari Foxglove
     # =================================================================
@@ -382,6 +415,9 @@ class MissionSequencer(Node):
             self._handle_abort()
         elif cmd == 'SET_INDEX':
             self._handle_set_index(data)
+        # ADDED(phase1-task1.5): direct command for D1 demo
+        elif cmd == 'MOVE_D1':
+            self._cmd_move_d1(data)
         else:
             self.warning = f'Command tidak dikenal: {cmd}'
             self.get_logger().warn(self.warning)
@@ -917,6 +953,52 @@ class MissionSequencer(Node):
             return float('inf')
         now_ns = self.get_clock().now().nanoseconds
         return (now_ns - self.odom_last_stamp_ns) / 1e6
+
+    # ADDED(phase1-task1.5): D1 demo command handler
+    def _cmd_move_d1(self, params: dict) -> bool:
+        """Handler untuk command MOVE_D1 — demo Modul D1 LKS.
+
+        Menjalankan 4 gerakan berurutan untuk demo juri:
+          1. Maju 250mm
+          2. Mundur 250mm
+          3. Geser kiri 250mm
+          4. Geser kanan 250mm
+
+        Args:
+            params: dict dari JSON command, optional keys:
+                distance_mm: jarak per gerakan (default 250)
+                speed_m_s: kecepatan (default dari motion config)
+
+        Returns:
+            True jika semua 4 gerakan berhasil, False jika timeout
+        """
+        distance = float(params.get('distance_mm', 250)) / 1000.0
+        speed = params.get('speed_m_s', None)
+        if speed is not None:
+            speed = float(speed)
+
+        self.get_logger().info(
+            f'MOVE_D1: starting demo sequence '
+            f'(distance={distance * 1000:.0f}mm, '
+            f'speed={"default" if speed is None else f"{speed:.2f} m/s"})')
+
+        results = [
+            self.primitives.move_forward(distance, speed),
+            self.primitives.move_backward(distance, speed),
+            self.primitives.move_left(distance, speed),
+            self.primitives.move_right(distance, speed),
+        ]
+
+        success = all(results)
+        if success:
+            self.get_logger().info('MOVE_D1: demo sequence complete — all OK')
+        else:
+            failed = [i + 1 for i, r in enumerate(results) if not r]
+            self.get_logger().warn(
+                f'MOVE_D1: demo sequence incomplete — '
+                f'step(s) {failed} timed out')
+
+        return success
 
     # =================================================================
     # Publish /mission/status (JSON untuk Foxglove)
