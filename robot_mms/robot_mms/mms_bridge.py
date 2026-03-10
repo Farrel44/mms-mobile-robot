@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, Range  # ADDED(phase2-ultrasonic): Range
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Empty
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -27,11 +27,17 @@ import math
 import threading
 
 from . import kinematics
+from .constants import (  # ADDED(phase2-ultrasonic)
+    ULTRASONIC_COUNT,
+    ULTRASONIC_MIN_DIST_M,
+    ULTRASONIC_MAX_DIST_M,
+    ULTRASONIC_INVALID_MM,
+)
 
 # Protokol serial (sesuai firmware STM32 — identik dengan ESP32)
 PACKET_HEADER = 0xA5
 CMD_PACKET_SIZE = 8       # header(1) + 3×int16(6) + xor(1)
-FEEDBACK_PACKET_SIZE = 26  # header(1) + 3×int32(12) + 3×int16 gyro(6) + 3×int16 accel(6) + xor(1)
+FEEDBACK_PACKET_SIZE = 42  # UPDATED(phase2-ultrasonic): 26 → 42 (added 16 bytes ultrasonic)
 
 
 class MotorBridge(Node):
@@ -241,6 +247,14 @@ class MotorBridge(Node):
         self.diag_pub = self.create_publisher(
             DiagnosticArray, '/diagnostics', 10)
         self.create_timer(1.0, self._publish_diagnostics)
+
+        # ADDED(phase2-ultrasonic): Ultrasonic publishers
+        self.us_front_pub = self.create_publisher(Range, '/ultrasonic/front', 10)
+        self.us_right_pub = self.create_publisher(Range, '/ultrasonic/right', 10)
+        self.us_rear_pub = self.create_publisher(Range, '/ultrasonic/rear', 10)
+        self.us_left_pub = self.create_publisher(Range, '/ultrasonic/left', 10)
+        self.us_raw_pub = self.create_publisher(
+            Float32MultiArray, '/ultrasonic/raw', 10)
         
     
     def publish_pose_callback(self):
@@ -517,7 +531,15 @@ class MotorBridge(Node):
             gyro = tuple(v / 1000.0 for v in gyro_raw)    # rad/s
             accel = tuple(v / 1000.0 for v in accel_raw)   # m/s²
 
-            return list(ticks), gyro, accel
+            # ADDED(phase2-ultrasonic): parse 8 ultrasonic uint16 BE
+            ultrasonic_m = []
+            for i in range(ULTRASONIC_COUNT):
+                offset = 25 + i * 2
+                raw = struct.unpack('>H', packet[offset:offset + 2])[0]
+                dist_m = None if raw == ULTRASONIC_INVALID_MM else raw / 1000.0
+                ultrasonic_m.append(dist_m)
+
+            return list(ticks), gyro, accel, ultrasonic_m
         except struct.error as e:
             self.get_logger().error(f'Error unpack feedback: {e}')
             return None
@@ -609,10 +631,12 @@ class MotorBridge(Node):
 
         # Parse semua paket valid
         samples = []
+        last_ultrasonic = None  # ADDED(phase2-ultrasonic)
         for pkt in packets:
             result = self.parse_feedback_packet(pkt)
             if result is not None:
-                samples.append(result)
+                samples.append(result[:3])  # (ticks, gyro, accel)
+                last_ultrasonic = result[3]  # ADDED(phase2-ultrasonic)
                 self.serial_rx_count += 1  # Rec 6: count valid packets
 
         if not samples:
@@ -621,6 +645,10 @@ class MotorBridge(Node):
         stamp_now = self.get_clock().now()
         self._integrate_odometry(samples, stamp_now)
         self._publish_all(stamp_now)
+
+        # ADDED(phase2-ultrasonic): publish ultrasonic dari paket terakhir
+        if last_ultrasonic is not None:
+            self._publish_ultrasonic(last_ultrasonic)
 
     def _integrate_odometry(self, samples, stamp_now):
         """Integrasi odometry dari batch feedback samples.
@@ -801,6 +829,55 @@ class MotorBridge(Node):
         tf.transform.rotation.z = sin_half
         tf.transform.rotation.w = cos_half
         self.tf_broadcaster.sendTransform(tf)
+
+    # =================================================================
+    # ADDED(phase2-ultrasonic): Ultrasonic Publisher
+    # =================================================================
+
+    def _publish_ultrasonic(self, ultrasonic_m: list) -> None:
+        """Publish data ultrasonik ke ROS2 topics.
+
+        Mapping index ke arah:
+          0,1 = front_a, front_b  → /ultrasonic/front  (rata-rata)
+          2,3 = right_a, right_b  → /ultrasonic/right
+          4,5 = rear_a,  rear_b   → /ultrasonic/rear
+          6,7 = left_a,  left_b   → /ultrasonic/left
+
+        Invalid sensor (None) dikecualikan dari rata-rata.
+        Jika kedua sensor invalid → publish Range.range = -1.0
+
+        Args:
+            ultrasonic_m: list 8 float (meter) atau None per sensor.
+        """
+        direction_pubs = [
+            (self.us_front_pub, 0, 1),
+            (self.us_right_pub, 2, 3),
+            (self.us_rear_pub,  4, 5),
+            (self.us_left_pub,  6, 7),
+        ]
+
+        now = self.get_clock().now().to_msg()
+
+        for pub, idx_a, idx_b in direction_pubs:
+            msg = Range()
+            msg.header.stamp = now
+            msg.header.frame_id = self.base_frame_id
+            msg.radiation_type = Range.ULTRASOUND
+            msg.field_of_view = 0.26  # ~15 derajat HC-SR04
+            msg.min_range = float(ULTRASONIC_MIN_DIST_M)
+            msg.max_range = float(ULTRASONIC_MAX_DIST_M)
+
+            # Rata-rata dua sensor per arah, skip yang None
+            vals = [v for v in [ultrasonic_m[idx_a], ultrasonic_m[idx_b]]
+                    if v is not None]
+            msg.range = sum(vals) / len(vals) if vals else -1.0
+            pub.publish(msg)
+
+        # Publish raw semua 8 nilai (None → -1.0)
+        raw_msg = Float32MultiArray()
+        raw_msg.data = [float(v) if v is not None else -1.0
+                        for v in ultrasonic_m]
+        self.us_raw_pub.publish(raw_msg)
 
     def _fill_odom_covariance(self, odom):
         """Populate odometry covariance matrices (Rec 1).

@@ -103,8 +103,9 @@ SERIAL_FRAME_HEADER = 0xA5
 SERIAL_CMD_PACKET_SIZE = 8
 """Ukuran paket command Pi→STM32: [0xA5][RPM1(2)][RPM2(2)][RPM3(2)][XOR] = 8 bytes."""
 
-SERIAL_FEEDBACK_PACKET_SIZE = 26
-"""Ukuran paket feedback STM32→Pi: [0xA5][T1(4)][T2(4)][T3(4)][G(6)][A(6)][XOR] = 26 bytes."""
+SERIAL_FEEDBACK_PACKET_SIZE = 42
+"""Ukuran paket feedback STM32→Pi: 42 bytes (encoder+IMU+ultrasonic+XOR).
+Updated from 26 to 42 bytes — ADDED(phase2-ultrasonic)."""
 
 SERIAL_FEEDBACK_RATE_HZ = 50
 """Rate feedback dari STM32 (Hz). TaskSerial mengirim setiap 20 ms."""
@@ -173,3 +174,49 @@ OBSTACLE_SAFE_DISTANCE_M = OBSTACLE_SAFE_DISTANCE_CM / 100.0
 
 LINE_FOLLOW_THRESHOLD = 0.5
 """Threshold sensor garis digital (0.0–1.0, referensi kalibrasi)."""
+
+# =====================================================================
+# Ultrasonic Sensors — ADDED(phase2-ultrasonic)
+# =====================================================================
+
+ULTRASONIC_COUNT: int = 8
+"""Jumlah sensor ultrasonik (2 per arah × 4 arah)."""
+
+ULTRASONIC_SENSOR_NAMES: tuple = (
+    "front_a", "front_b",
+    "right_a", "right_b",
+    "rear_a",  "rear_b",
+    "left_a",  "left_b",
+)
+"""Nama sensor index 0-7, sesuai urutan di feedback packet."""
+
+ULTRASONIC_DIRECTION_NAMES: tuple = ("front", "right", "rear", "left")
+"""4 arah, masing-masing punya 2 sensor (a dan b)."""
+
+ULTRASONIC_MIN_DIST_M: float = 0.020
+"""Jarak minimum valid (m) — 20 mm."""
+
+ULTRASONIC_MAX_DIST_M: float = 4.000
+"""Jarak maksimum valid (m) — 4000 mm."""
+
+ULTRASONIC_INVALID_MM: int = 0xFFFF
+"""Sentinel value dari STM32 untuk sensor invalid/timeout."""
+
+OBSTACLE_STOP_DIST_M: float = 0.075
+"""Jarak berhenti obstacle (m) — Modul D2 LKS: 50-100 mm, gunakan tengah 75 mm."""
+
+# =====================================================================
+# Line Sensor — ADDED(phase2-ultrasonic)
+# =====================================================================
+
+LINE_SENSOR_COUNT: int = 2
+"""Jumlah sensor garis digital."""
+
+LINE_SENSOR_NAMES: tuple = ("D1", "D2")
+"""Nama sensor garis, sesuai pin LINE_D1/LINE_D2 di STM32."""
+
+LINE_STATE_OFF: int = 0
+"""State sensor garis: tidak mendeteksi garis."""
+
+LINE_STATE_ON: int = 1
+"""State sensor garis: mendeteksi garis."""
