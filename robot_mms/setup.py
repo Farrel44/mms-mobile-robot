@@ -10,7 +10,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/config', ['config/mms_params.yaml']),
+        ('share/' + package_name + '/config', ['config/mms_params.yaml',
+                                                    'config/camera_params.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -23,6 +24,8 @@ setup(
         'console_scripts': [
             'mms_bridge = robot_mms.mms_bridge:main',
             'sensor_node = robot_mms.sensor_node:main',  # ADDED(phase2-sensor)
+            'color_detector = robot_mms.color_detector:main',  # ADDED(phase3-vision)
+            'shape_detector = robot_mms.shape_detector:main',  # ADDED(phase3-vision)
         ],
     },
 )
