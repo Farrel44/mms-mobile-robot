@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'mms_bridge = robot_mms.mms_bridge:main',
+            'sensor_node = robot_mms.sensor_node:main',  # ADDED(phase2-sensor)
         ],
     },
 )

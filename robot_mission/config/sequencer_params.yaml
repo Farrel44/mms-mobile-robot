@@ -50,3 +50,12 @@ mission_sequencer:
       ramp_decel_dist_m: 0.05           # start decel this far from target (m)
       move_timeout_s: 10.0              # timeout per primitive (s)
       cmd_vel_rate_hz: 20.0             # publish rate during move (Hz)
+
+      # REVISED(phase2-line-marker): Line sensor marker detection
+      line_marker_approach_speed_m_s: 0.08  # kecepatan saat approach marker
+                                             # pelan untuk akurasi stop
+
+      # ADDED(phase2-balance): Balance (wall alignment) parameters
+      balance_stop_dist_m: 0.050             # jarak merapat ke dinding (50mm)
+      balance_approach_speed_m_s: 0.05       # kecepatan balance
+      balance_timeout_s: 8.0                 # timeout balance

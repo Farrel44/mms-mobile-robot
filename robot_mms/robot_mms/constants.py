@@ -2,7 +2,6 @@
 """
 constants.py — Single source of truth untuk semua konstanta robot LKS.
 
-Semua nilai telah dikonfirmasi oleh owner hardware.
 JANGAN hardcode angka-angka ini di tempat lain — import dari sini.
 
 Referensi:
@@ -220,3 +219,20 @@ LINE_STATE_OFF: int = 0
 
 LINE_STATE_ON: int = 1
 """State sensor garis: mendeteksi garis."""
+
+# =====================================================================
+# Balance (Wall Alignment) — ADDED(phase2-balance)
+# =====================================================================
+
+BALANCE_STOP_DIST_M: float = 0.050
+"""
+Jarak berhenti saat BALANCE — lebih dekat dari obstacle stop.
+Robot benar-benar merapat ke dinding (50mm dari dinding).
+Berbeda dari OBSTACLE_STOP_DIST_M (75mm) yang untuk safety.
+"""
+
+BALANCE_APPROACH_SPEED_M_S: float = 0.05
+"""Kecepatan saat balance — pelan untuk akurasi dan safety."""
+
+BALANCE_TIMEOUT_S: float = 8.0
+"""Timeout balance — jika 8 detik tidak sampai, abort."""

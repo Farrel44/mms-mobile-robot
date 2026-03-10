@@ -21,6 +21,14 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
+# ─── Project ─────────────────────────────────────────────────────
+from robot_mms.constants import OBSTACLE_STOP_DIST_M  # ADDED(phase2-sensor)
+from robot_mms.constants import (  # ADDED(phase2-balance)
+    BALANCE_STOP_DIST_M,
+    BALANCE_APPROACH_SPEED_M_S,
+    BALANCE_TIMEOUT_S,
+)
+
 
 # =====================================================================
 # Default parameter values (fallback jika YAML tidak menyediakan)
@@ -104,6 +112,17 @@ class MotionPrimitives:
         self._odom_yaw: float = 0.0
         self._odom_received: bool = False
 
+        # ADDED(phase2-sensor): Obstacle awareness
+        self._obstacle_distances: dict[str, float] = {
+            'front': -1.0, 'right': -1.0, 'rear': -1.0, 'left': -1.0,
+        }
+        self._obstacle_check_enabled: bool = False
+
+        # REVISED(phase2-line-marker): Line sensor sebagai position marker
+        self._line_d1: int = 0
+        self._line_d2: int = 0
+        self._line_received: bool = False
+
     # =================================================================
     # Odom Interface
     # =================================================================
@@ -128,6 +147,59 @@ class MotionPrimitives:
             (x, y, yaw_rad) — posisi dan orientasi robot saat ini
         """
         return self._odom_x, self._odom_y, self._odom_yaw
+
+    # =================================================================
+    # Obstacle Awareness — ADDED(phase2-sensor)
+    # =================================================================
+
+    def set_obstacle_distances(self, distances: dict[str, float]) -> None:
+        """Update jarak obstacle per arah dari /obstacle/distances.
+
+        Dipanggil oleh host node setiap kali menerima data obstacle.
+
+        Args:
+            distances: dict {'front': m, 'right': m, 'rear': m, 'left': m}.
+                       Nilai -1.0 = invalid/tidak ada data.
+        """
+        self._obstacle_distances = dict(distances)
+
+    def enable_obstacle_check(self, enabled: bool) -> None:
+        """Aktifkan/nonaktifkan pengecekan obstacle saat _move_linear.
+
+        Args:
+            enabled: True untuk mengaktifkan obstacle stop.
+        """
+        self._obstacle_check_enabled = enabled
+        self._logger.info(f'Obstacle check {"enabled" if enabled else "disabled"}')
+
+    # =================================================================
+    # Line Sensor Interface — REVISED(phase2-line-marker)
+    # =================================================================
+
+    def update_line_state(self, d1: int, d2: int) -> None:
+        """Update state line sensor.
+
+        Dipanggil dari mission_sequencer setiap kali
+        menerima /line_sensor/state.
+
+        Args:
+            d1: state sensor kiri D1 (0=off, 1=on/garis terdeteksi)
+            d2: state sensor kanan D2 (0=off, 1=on/garis terdeteksi)
+        """
+        self._line_d1 = d1
+        self._line_d2 = d2
+        self._line_received = True
+
+    def _line_marker_detected(self) -> bool:
+        """Cek apakah line sensor mendeteksi marker posisi.
+
+        Returns True jika D1 ATAU D2 mendeteksi garis hitam.
+        Digunakan sebagai stop condition untuk move_until_marker().
+
+        Returns:
+            True jika marker terdeteksi, False jika tidak.
+        """
+        return bool(self._line_d1 or self._line_d2)
 
     # =================================================================
     # Quaternion & Angle Utilities
@@ -321,6 +393,16 @@ class MotionPrimitives:
                     f'Move complete: traveled {traveled * 1000:.0f}mm '
                     f'in {elapsed:.1f}s')
                 return True
+
+            # ADDED(phase2-sensor): Obstacle check — stop jika obstacle di arah gerak
+            if self._obstacle_check_enabled:
+                obs_dist = self._obstacle_distances.get(direction, -1.0)
+                if 0.0 <= obs_dist < OBSTACLE_STOP_DIST_M:
+                    self.stop()
+                    self._logger.warn(
+                        f'Obstacle detected {direction} at '
+                        f'{obs_dist * 1000:.0f}mm — stopping')
+                    return False
 
             # Compute trapezoidal speed
             current_speed = self._compute_trapezoidal_speed(
@@ -530,4 +612,276 @@ class MotionPrimitives:
         """
         for _ in range(3):
             self._publish_cmd_vel(0.0, 0.0, 0.0)
+            time.sleep(self._dt)
+
+    # =================================================================
+    # Move Until Marker — REVISED(phase2-line-marker)
+    # =================================================================
+
+    def move_until_marker(
+        self,
+        vx: float = 0.10,
+        vy: float = 0.0,
+        wz: float = 0.0,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Gerakkan robot dengan kecepatan tetap sampai line sensor
+        mendeteksi marker posisi (garis hitam di lantai).
+
+        Digunakan untuk:
+          - Maju sampai posisi rak
+          - Maju sampai posisi standbox
+          - Bergerak ke titik referensi manapun
+
+        Stop condition:
+          D1=1 ATAU D2=1 → marker terdeteksi → stop, return True
+          timeout_s terlewat → stop, return False (tidak ketemu marker)
+
+        Args:
+            vx: kecepatan linear x (m/s), default 0.10 maju
+            vy: kecepatan linear y (m/s), default 0.0
+            wz: kecepatan angular z (rad/s), default 0.0
+            timeout_s: timeout, None = pakai move_timeout_s dari params
+
+        Returns:
+            True jika marker terdeteksi dan robot berhenti
+            False jika timeout (marker tidak ditemukan)
+
+        Notes:
+            Tidak menggunakan trapezoidal profile —
+            kecepatan konstan karena jarak tidak diketahui.
+            Gunakan kecepatan rendah (≤0.10 m/s) untuk akurasi stop.
+        """
+        if timeout_s is None:
+            timeout_s = self._timeout
+
+        if not self._line_received:
+            self._logger.warn(
+                'move_until_marker: /line_sensor/state belum diterima')
+
+        self._logger.info(
+            f'Moving until marker: '
+            f'vx={vx:.2f}, vy={vy:.2f}, wz={wz:.2f}')
+
+        t_start = time.monotonic()
+
+        while True:
+            elapsed = time.monotonic() - t_start
+
+            if elapsed > timeout_s:
+                self.stop()
+                self._logger.warn(
+                    f'move_until_marker timeout {elapsed:.1f}s '
+                    f'— marker not found')
+                return False
+
+            # Stop condition: marker terdeteksi
+            if self._line_marker_detected():
+                self.stop()
+                self._logger.info(
+                    f'Marker detected! '
+                    f'D1={self._line_d1} D2={self._line_d2} '
+                    f'after {elapsed:.1f}s')
+                return True
+
+            # Publish kecepatan konstan
+            self._publish_cmd_vel(vx, vy, wz)
+            time.sleep(self._dt)
+
+    # =================================================================
+    # Approach Wall — ADDED(phase2-sensor)
+    # =================================================================
+
+    def approach_wall(
+        self,
+        direction: str,
+        target_dist_m: float | None = None,
+        speed_m_s: float | None = None,
+    ) -> bool:
+        """Maju ke arah dinding sampai jarak ultrasonik mencapai target.
+
+        Modul D2 LKS: robot mendekati dinding sampai jarak tertentu, lalu berhenti.
+
+        Robot bergerak ke arah `direction` dengan kecepatan rendah,
+        terus monitoring jarak ultrasonik arah tersebut.
+        Berhenti saat jarak ≤ target_dist_m.
+
+        Args:
+            direction: arah dinding ('front', 'right', 'rear', 'left')
+            target_dist_m: jarak target berhenti (m). None = OBSTACLE_STOP_DIST_M
+            speed_m_s: kecepatan approach (m/s). None = default_linear_speed / 2
+
+        Returns:
+            True jika target jarak tercapai, False jika timeout atau sensor invalid
+        """
+        if not self._odom_received:
+            self._logger.warn('Approach wall aborted: odom belum diterima')
+            self.stop()
+            return False
+
+        target = target_dist_m if target_dist_m is not None else OBSTACLE_STOP_DIST_M
+        speed = speed_m_s if speed_m_s is not None else self._default_linear_speed / 2.0
+        speed = min(abs(speed), self._max_linear_speed)
+
+        # Map direction ke vx/vy sign
+        dir_map: dict[str, tuple[float, float]] = {
+            'front':  ( 1.0,  0.0),
+            'rear':   (-1.0,  0.0),
+            'left':   ( 0.0,  1.0),
+            'right':  ( 0.0, -1.0),
+        }
+        if direction not in dir_map:
+            self._logger.error(f'Approach wall: invalid direction "{direction}"')
+            return False
+
+        vx_sign, vy_sign = dir_map[direction]
+
+        self._logger.info(
+            f'Approach wall {direction}: target {target * 1000:.0f}mm '
+            f'at {speed:.2f} m/s')
+
+        t_start = time.monotonic()
+
+        while True:
+            elapsed = time.monotonic() - t_start
+            if elapsed > self._timeout:
+                self._logger.warn(
+                    f'Approach wall timeout after {elapsed:.1f}s')
+                self.stop()
+                return False
+
+            # Cek jarak ultrasonik di arah gerak
+            obs_dist = self._obstacle_distances.get(direction, -1.0)
+
+            if obs_dist < 0.0:
+                # Sensor invalid — terus bergerak (best effort)
+                pass
+            elif obs_dist <= target:
+                # Target tercapai
+                self.stop()
+                self._logger.info(
+                    f'Approach wall {direction} complete: '
+                    f'distance {obs_dist * 1000:.0f}mm in {elapsed:.1f}s')
+                return True
+
+            # Publish cmd_vel (kecepatan konstan, tanpa trapesoid)
+            self._publish_cmd_vel(
+                vx_sign * speed,
+                vy_sign * speed,
+                0.0,
+            )
+
+            time.sleep(self._dt)
+
+    # =================================================================
+    # Balance (Wall Alignment) — ADDED(phase2-balance)
+    # =================================================================
+
+    def balance(
+        self,
+        direction: str,
+        stop_distance_m: float | None = None,
+        speed_m_s: float | None = None,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Rapatkan robot ke dinding di arah tertentu (wall alignment).
+
+        Robot bergerak pelan ke arah yang ditentukan sampai sensor
+        ultrasonik di arah tersebut mendeteksi jarak <= stop_distance_m.
+
+        Digunakan sebagai self-correction posisi sebelum task presisi:
+          balance('left')  → rapatkan ke dinding kiri
+          balance('front') → rapatkan ke dinding depan
+          dll.
+
+        Berbeda dari approach_wall():
+          - approach_wall: berhenti di OBSTACLE_STOP_DIST_M (75mm, safety)
+          - balance: berhenti di BALANCE_STOP_DIST_M (50mm, merapat)
+
+        Args:
+            direction: arah balance
+                       'front'/'depan'   → maju ke dinding depan
+                       'rear'/'belakang' → mundur ke dinding belakang
+                       'left'/'kiri'     → geser ke dinding kiri
+                       'right'/'kanan'   → geser ke dinding kanan
+            stop_distance_m: jarak berhenti (None = BALANCE_STOP_DIST_M)
+            speed_m_s: kecepatan (None = BALANCE_APPROACH_SPEED_M_S)
+            timeout_s: timeout (None = BALANCE_TIMEOUT_S)
+
+        Returns:
+            True jika berhasil merapat ke dinding
+            False jika timeout (dinding tidak ditemukan)
+
+        Notes:
+            Mendukung nama arah dalam Bahasa Indonesia dan Inggris
+            untuk kemudahan operator saat input di Foxglove.
+        """
+        # Normalize direction — support Bahasa Indonesia & English
+        dir_aliases: dict[str, str] = {
+            'depan':    'front',
+            'belakang': 'rear',
+            'kiri':     'left',
+            'kanan':    'right',
+            'front':    'front',
+            'rear':     'rear',
+            'left':     'left',
+            'right':    'right',
+        }
+        normalized = dir_aliases.get(direction.lower())
+        if normalized is None:
+            self._logger.error(
+                f'balance: invalid direction "{direction}". '
+                f'Valid: front/depan, rear/belakang, left/kiri, right/kanan')
+            return False
+
+        stop_dist = stop_distance_m if stop_distance_m is not None \
+                    else BALANCE_STOP_DIST_M
+        speed = speed_m_s if speed_m_s is not None \
+                else BALANCE_APPROACH_SPEED_M_S
+        timeout = timeout_s if timeout_s is not None \
+                  else BALANCE_TIMEOUT_S
+
+        # Map direction ke velocity signs  # ADDED(phase2-balance)
+        dir_to_vel: dict[str, tuple[float, float]] = {
+            'front': (speed,  0.0),
+            'rear':  (-speed, 0.0),
+            'left':  (0.0,  speed),
+            'right': (0.0, -speed),
+        }
+        vx, vy = dir_to_vel[normalized]
+
+        self._logger.info(
+            f'Balance {direction} ({normalized}): '
+            f'moving until ultrasonik < {stop_dist * 1000:.0f}mm')
+
+        t_start = time.monotonic()
+        _warned_no_data = False  # ADDED(phase2-balance): warn once flag
+
+        while True:
+            elapsed = time.monotonic() - t_start
+
+            if elapsed > timeout:
+                self.stop()
+                self._logger.warn(
+                    f'Balance {direction} timeout {elapsed:.1f}s '
+                    f'— wall not found')
+                return False
+
+            # Cek ultrasonik di arah yang dituju  # ADDED(phase2-balance)
+            obs_dist = self._obstacle_distances.get(normalized, -1.0)
+
+            if obs_dist >= 0.0 and obs_dist <= stop_dist:
+                self.stop()
+                self._logger.info(
+                    f'Balance {direction} complete: '
+                    f'{obs_dist * 1000:.0f}mm in {elapsed:.1f}s')
+                return True
+
+            if obs_dist < 0.0 and not _warned_no_data:
+                self._logger.warn(
+                    'balance: obstacle_distances belum tersedia, '
+                    'pastikan sensor_node berjalan')
+                _warned_no_data = True
+
+            self._publish_cmd_vel(vx, vy, 0.0)
             time.sleep(self._dt)

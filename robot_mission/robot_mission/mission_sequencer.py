@@ -25,10 +25,13 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32MultiArray, Int8MultiArray  # ADDED(phase2-sensor), REVISED(phase2-line-marker)
 
 # ADDED(phase1-task1.5): import motion primitives helper
 from .motion_primitives import MotionPrimitives
+
+# ADDED(phase2-sensor): import ultrasonic direction names
+from robot_mms.constants import ULTRASONIC_DIRECTION_NAMES
 
 
 # =====================================================================
@@ -173,6 +176,12 @@ COMMAND_REGISTRY = {
     'MAJU_JARAK':   None,
     'MUNDUR_JARAK': None,
     'MOVE_D1':      None,       # ADDED(phase1-task1.5): handled via primitives
+    'APPROACH_WALL': None,      # ADDED(phase2-sensor): handled via primitives
+    'MOVE_UNTIL_MARKER': None,  # REVISED(phase2-line-marker): handled via primitives
+    'BALANCE_DEPAN':    None,    # ADDED(phase2-balance): wall alignment
+    'BALANCE_BELAKANG': None,    # ADDED(phase2-balance): wall alignment
+    'BALANCE_KIRI':     None,    # ADDED(phase2-balance): wall alignment
+    'BALANCE_KANAN':    None,    # ADDED(phase2-balance): wall alignment
 }
 
 
@@ -260,6 +269,16 @@ class MissionSequencer(Node):
 
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self._on_odom, 10)
+
+        # ADDED(phase2-sensor): Subscribe ke /obstacle/distances
+        self.obstacle_sub = self.create_subscription(
+            Float32MultiArray, '/obstacle/distances',
+            self._on_obstacle_distances, 10)
+
+        # REVISED(phase2-line-marker): Subscribe ke /line_sensor/state
+        self.line_sensor_sub = self.create_subscription(
+            Int8MultiArray, '/line_sensor/state',
+            self._on_line_sensor, 10)
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.status_pub = self.create_publisher(String, '/mission/status', 10)
@@ -418,6 +437,16 @@ class MissionSequencer(Node):
         # ADDED(phase1-task1.5): direct command for D1 demo
         elif cmd == 'MOVE_D1':
             self._cmd_move_d1(data)
+        # ADDED(phase2-sensor): approach wall command for D2
+        elif cmd == 'APPROACH_WALL':
+            self._cmd_approach_wall(data)
+        # REVISED(phase2-line-marker): move until line marker
+        elif cmd == 'MOVE_UNTIL_MARKER':
+            self._cmd_move_until_marker(data)
+        # ADDED(phase2-balance): wall alignment commands
+        elif cmd in ('BALANCE_DEPAN', 'BALANCE_BELAKANG',
+                     'BALANCE_KIRI', 'BALANCE_KANAN'):
+            self._cmd_balance_dispatch(cmd, data)
         else:
             self.warning = f'Command tidak dikenal: {cmd}'
             self.get_logger().warn(self.warning)
@@ -953,6 +982,182 @@ class MissionSequencer(Node):
             return float('inf')
         now_ns = self.get_clock().now().nanoseconds
         return (now_ns - self.odom_last_stamp_ns) / 1e6
+
+    # REVISED(phase2-line-marker): line sensor callback
+    def _on_line_sensor(self, msg: Int8MultiArray) -> None:
+        """Update state line sensor di motion primitives.
+
+        Dipanggil saat /line_sensor/state publish.
+        Forward ke primitives untuk digunakan oleh move_until_marker().
+
+        Args:
+            msg: std_msgs/Int8MultiArray dari ObstacleSensorNode
+        """
+        if len(msg.data) >= 2:
+            self.primitives.update_line_state(
+                int(msg.data[0]),  # D1 kiri
+                int(msg.data[1]),  # D2 kanan
+            )
+
+    # ADDED(phase2-sensor): obstacle distances callback
+    def _on_obstacle_distances(self, msg: Float32MultiArray) -> None:
+        """Callback /obstacle/distances — forward ke MotionPrimitives.
+
+        Data format: [front, right, rear, left] meter. -1.0 = invalid.
+
+        Args:
+            msg: std_msgs/Float32MultiArray dari ObstacleSensorNode
+        """
+        if len(msg.data) >= len(ULTRASONIC_DIRECTION_NAMES):
+            distances = {
+                d: msg.data[i]
+                for i, d in enumerate(ULTRASONIC_DIRECTION_NAMES)
+            }
+            self.primitives.set_obstacle_distances(distances)
+
+    # ADDED(phase2-sensor): approach wall command handler
+    def _cmd_approach_wall(self, params: dict) -> bool:
+        """Handler untuk command APPROACH_WALL — demo Modul D2 LKS.
+
+        Robot mendekati dinding di arah tertentu sampai jarak ultrasonik
+        mencapai target, lalu berhenti.
+
+        Args:
+            params: dict dari JSON command, keys:
+                direction: arah dinding ('front', 'right', 'rear', 'left')
+                target_mm: jarak target berhenti (mm), default 75
+                speed_m_s: kecepatan approach (m/s), default dari motion config
+
+        Returns:
+            True jika target tercapai, False jika timeout
+        """
+        direction = str(params.get('direction', 'front')).lower()
+        target_mm = float(params.get('target_mm', 75))
+        target_m = target_mm / 1000.0
+        speed = params.get('speed_m_s', None)
+        if speed is not None:
+            speed = float(speed)
+
+        self.get_logger().info(
+            f'APPROACH_WALL: direction={direction}, '
+            f'target={target_mm:.0f}mm, '
+            f'speed={"default" if speed is None else f"{speed:.2f} m/s"}')
+
+        success = self.primitives.approach_wall(
+            direction=direction,
+            target_dist_m=target_m,
+            speed_m_s=speed,
+        )
+
+        if success:
+            self.get_logger().info('APPROACH_WALL: complete')
+        else:
+            self.get_logger().warn('APPROACH_WALL: failed (timeout/error)')
+
+        return success
+
+    # REVISED(phase2-line-marker): move until marker command handler
+    def _cmd_move_until_marker(self, params: dict) -> bool:
+        """Handler untuk move_until_marker.
+
+        Gerakkan robot sampai line sensor deteksi marker posisi.
+        Digunakan untuk positioning presisi di depan rak atau standbox.
+
+        Args:
+            params: dict dari JSON command, keys:
+                vx: kecepatan x (default 0.08 m/s = pelan untuk akurasi)
+                vy: kecepatan y (default 0.0)
+                wz: kecepatan angular (default 0.0)
+                timeout_s: batas waktu (default 10.0)
+
+        Returns:
+            True jika marker ditemukan, False jika timeout
+        """
+        vx = float(params.get('vx', 0.08))
+        vy = float(params.get('vy', 0.0))
+        wz = float(params.get('wz', 0.0))
+        timeout_s = float(params.get('timeout_s', 10.0))
+
+        self.get_logger().info(
+            f'MOVE_UNTIL_MARKER: vx={vx:.2f}, vy={vy:.2f}, '
+            f'wz={wz:.2f}, timeout={timeout_s:.1f}s')
+
+        success = self.primitives.move_until_marker(vx, vy, wz, timeout_s)
+
+        if success:
+            self.get_logger().info('MOVE_UNTIL_MARKER: marker found')
+        else:
+            self.get_logger().warn('MOVE_UNTIL_MARKER: timeout — marker not found')
+
+        return success
+
+    # ADDED(phase2-balance): wall alignment command handlers
+    def _cmd_balance(self, params: dict, direction: str) -> bool:
+        """Generik handler untuk semua BALANCE commands.
+
+        Args:
+            params: parameter dari step table Foxglove
+            direction: arah balance (sudah dinormalisasi)
+
+        Params yang didukung:
+          stop_distance_mm: jarak berhenti (default 50mm)
+          speed_m_s: kecepatan (default 0.05)
+          timeout_s: timeout (default 8.0)
+        """
+        stop_dist = params.get('stop_distance_mm', 50) / 1000.0
+        speed = params.get('speed_m_s', 0.05)
+        timeout = params.get('timeout_s', 8.0)
+        return self.primitives.balance(
+            direction=direction,
+            stop_distance_m=stop_dist,
+            speed_m_s=speed,
+            timeout_s=timeout,
+        )
+
+    def _cmd_balance_dispatch(self, cmd: str, params: dict) -> bool:
+        """Dispatch BALANCE_* commands ke arah yang sesuai.
+
+        Args:
+            cmd: nama command (BALANCE_DEPAN, BALANCE_BELAKANG, dll)
+            params: parameter dari JSON command
+
+        Returns:
+            True jika balance berhasil, False jika timeout
+        """
+        cmd_to_dir: dict[str, str] = {
+            'BALANCE_DEPAN':    'front',
+            'BALANCE_BELAKANG': 'rear',
+            'BALANCE_KIRI':     'left',
+            'BALANCE_KANAN':    'right',
+        }
+        direction = cmd_to_dir.get(cmd, 'front')
+        self.get_logger().info(
+            f'{cmd}: balance direction={direction}')
+
+        success = self._cmd_balance(params, direction)
+
+        if success:
+            self.get_logger().info(f'{cmd}: complete')
+        else:
+            self.get_logger().warn(f'{cmd}: failed (timeout/error)')
+
+        return success
+
+    def _cmd_balance_depan(self, params: dict) -> bool:
+        """Balance ke dinding depan (maju sampai ultrasonik depan trigger)."""
+        return self._cmd_balance(params, 'front')
+
+    def _cmd_balance_belakang(self, params: dict) -> bool:
+        """Balance ke dinding belakang (mundur sampai ultrasonik belakang trigger)."""
+        return self._cmd_balance(params, 'rear')
+
+    def _cmd_balance_kiri(self, params: dict) -> bool:
+        """Balance ke dinding kiri (geser kiri sampai ultrasonik kiri trigger)."""
+        return self._cmd_balance(params, 'left')
+
+    def _cmd_balance_kanan(self, params: dict) -> bool:
+        """Balance ke dinding kanan (geser kanan sampai ultrasonik kanan trigger)."""
+        return self._cmd_balance(params, 'right')
 
     # ADDED(phase1-task1.5): D1 demo command handler
     def _cmd_move_d1(self, params: dict) -> bool:
