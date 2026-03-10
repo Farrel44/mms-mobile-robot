@@ -85,6 +85,7 @@ class MotionPrimitives:
 
         # Load parameters dengan fallback ke defaults
         p = params or {}
+        self._params = p  # ADDED(phase2-d3-linefollower): store for follow_line_u
         self._pos_tol = float(p.get('position_tolerance_m',
                                      _DEFAULTS['position_tolerance_m']))
         self._angle_tol_deg = float(p.get('angle_tolerance_deg',
@@ -884,4 +885,105 @@ class MotionPrimitives:
                 _warned_no_data = True
 
             self._publish_cmd_vel(vx, vy, 0.0)
+            time.sleep(self._dt)
+
+    # =================================================================
+    # Line Follow U — ADDED(phase2-d3-linefollower)
+    # =================================================================
+
+    def follow_line_u(
+        self,
+        speed_m_s: float | None = None,
+        timeout_s: float = 30.0,
+    ) -> bool:
+        """Ikuti garis hitam berbentuk U untuk Modul D3 LKS.
+
+        Line sensor sebagai line tracer:
+          D1=kiri, D2=kanan
+          D1=0, D2=0 → lost → recovery: putar ke arah last_error
+          D1=1, D2=0 → garis di kiri → koreksi belok kiri (wz positif)
+          D1=0, D2=1 → garis di kanan → koreksi belok kanan (wz negatif)
+          D1=1, D2=1 → on center → jalan lurus
+
+        PD control:
+          error = D1 - D2  → range: -1, 0, +1
+          correction = Kp*error + Kd*(error - prev_error)/dt
+          vx = base_speed
+          wz = correction
+
+        Stop condition (selesai U):
+          Lost terus menerus > lost_timeout_s → return True
+
+        Args:
+            speed_m_s: kecepatan maju (None = dari YAML base_speed)
+            timeout_s: batas waktu total (s)
+
+        Returns:
+            True jika selesai (garis U habis, lost > lost_timeout_s)
+            False jika timeout total
+        """
+        # Load params dari self._params atau defaults  # ADDED(phase2-d3-linefollower)
+        base_speed = speed_m_s if speed_m_s is not None else float(
+            self._params.get('line_follower_base_speed_m_s', 0.08))
+        kp = float(self._params.get('line_follower_kp', 0.30))
+        kd = float(self._params.get('line_follower_kd', 0.05))
+        lost_timeout = float(self._params.get(
+            'line_follower_lost_timeout_s', 1.5))
+        recovery_wz = float(self._params.get(
+            'line_follower_recovery_wz_rad_s', 0.20))
+
+        self._logger.info(
+            f'follow_line_u: speed={base_speed} kp={kp} kd={kd}')
+
+        if not self._line_received:
+            self._logger.warn(
+                'follow_line_u: /line_sensor/state belum diterima')
+
+        prev_error = 0
+        last_error = 0        # untuk recovery direction
+        lost_start = None     # timestamp mulai lost
+        t_start = time.monotonic()
+
+        while True:
+            elapsed = time.monotonic() - t_start
+
+            if elapsed > timeout_s:
+                self.stop()
+                self._logger.warn(f'follow_line_u timeout {elapsed:.1f}s')
+                return False
+
+            d1 = self._line_d1
+            d2 = self._line_d2
+
+            # LOST state: kedua sensor tidak mendeteksi garis
+            if d1 == 0 and d2 == 0:
+                if lost_start is None:
+                    lost_start = time.monotonic()
+
+                lost_duration = time.monotonic() - lost_start
+                if lost_duration >= lost_timeout:
+                    # Selesai U — garis benar-benar habis
+                    self.stop()
+                    self._logger.info(
+                        f'follow_line_u complete: '
+                        f'line lost {lost_duration:.1f}s → U done')
+                    return True
+
+                # Recovery: putar ke arah last error
+                wz = recovery_wz if last_error >= 0 else -recovery_wz
+                self._publish_cmd_vel(0.0, 0.0, wz)
+
+            else:
+                # Garis terdeteksi → reset lost timer
+                lost_start = None
+
+                error = d1 - d2   # -1, 0, atau +1
+                dt = self._dt
+                correction = kp * error + kd * (error - prev_error) / dt
+
+                prev_error = error
+                last_error = error
+
+                self._publish_cmd_vel(base_speed, 0.0, correction)
+
             time.sleep(self._dt)

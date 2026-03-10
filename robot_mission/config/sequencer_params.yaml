@@ -59,3 +59,10 @@ mission_sequencer:
       balance_stop_dist_m: 0.050             # jarak merapat ke dinding (50mm)
       balance_approach_speed_m_s: 0.05       # kecepatan balance
       balance_timeout_s: 8.0                 # timeout balance
+
+      # ADDED(phase2-d3-linefollower): Line follower (D3) parameters
+      line_follower_base_speed_m_s: 0.08     # kecepatan maju saat follow line
+      line_follower_kp: 0.30                 # PD proportional gain
+      line_follower_kd: 0.05                 # PD derivative gain
+      line_follower_lost_timeout_s: 1.5      # line hilang > ini = selesai U
+      line_follower_recovery_wz_rad_s: 0.20  # kecepatan putar recovery

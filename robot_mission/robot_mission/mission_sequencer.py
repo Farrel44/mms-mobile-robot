@@ -182,6 +182,7 @@ COMMAND_REGISTRY = {
     'BALANCE_BELAKANG': None,    # ADDED(phase2-balance): wall alignment
     'BALANCE_KIRI':     None,    # ADDED(phase2-balance): wall alignment
     'BALANCE_KANAN':    None,    # ADDED(phase2-balance): wall alignment
+    'LINE_FOLLOW_U':    None,    # ADDED(phase2-d3-linefollower): line follow U
 }
 
 
@@ -447,6 +448,9 @@ class MissionSequencer(Node):
         elif cmd in ('BALANCE_DEPAN', 'BALANCE_BELAKANG',
                      'BALANCE_KIRI', 'BALANCE_KANAN'):
             self._cmd_balance_dispatch(cmd, data)
+        # ADDED(phase2-d3-linefollower): line follow U command
+        elif cmd == 'LINE_FOLLOW_U':
+            self._cmd_line_follow_u(data)
         else:
             self.warning = f'Command tidak dikenal: {cmd}'
             self.get_logger().warn(self.warning)
@@ -1158,6 +1162,32 @@ class MissionSequencer(Node):
     def _cmd_balance_kanan(self, params: dict) -> bool:
         """Balance ke dinding kanan (geser kanan sampai ultrasonik kanan trigger)."""
         return self._cmd_balance(params, 'right')
+
+    # ADDED(phase2-d3-linefollower): line follow U command handler
+    def _cmd_line_follow_u(self, params: dict) -> bool:
+        """Handler untuk LINE_FOLLOW_U — ikuti garis U Modul D3 LKS.
+
+        Args:
+            params: parameter dari JSON command (opsional speed, timeout)
+
+        Returns:
+            True jika selesai (garis U habis), False jika timeout
+        """
+        speed = params.get('speed', None)
+        timeout = params.get('timeout', 30.0)
+
+        self.get_logger().info(
+            f'LINE_FOLLOW_U: speed={speed} timeout={timeout}')
+
+        success = self.primitives.follow_line_u(
+            speed_m_s=speed, timeout_s=timeout)
+
+        if success:
+            self.get_logger().info('LINE_FOLLOW_U: complete (U done)')
+        else:
+            self.get_logger().warn('LINE_FOLLOW_U: timeout')
+
+        return success
 
     # ADDED(phase1-task1.5): D1 demo command handler
     def _cmd_move_d1(self, params: dict) -> bool:

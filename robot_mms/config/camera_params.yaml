@@ -1,0 +1,55 @@
+# camera_params.yaml — Parameter deteksi warna dan bentuk untuk LKS
+#
+# Label output WAJIB persis sesuai kisi-kisi LKS:
+#   Warna saja  : "merah", "hijau", "biru"
+#   Bentuk+warna: "O-merah", "O-hijau"  (O = lingkaran/circle)
+#
+# HSV range di OpenCV: H=0-179, S=0-255, V=0-255
+
+color_detection:
+  # Merah — HSV dual range (merah ada di kedua ujung hue)
+  red:
+    label: "merah"
+    hsv_ranges:
+      - lower: [0,   100, 80]   # range bawah (0-10)
+        upper: [10,  255, 255]
+      - lower: [165, 100, 80]   # range atas (165-179)
+        upper: [179, 255, 255]
+    min_area_px: 500
+    confidence_threshold: 0.02  # min ratio area_mask/area_frame
+
+  # Hijau
+  green:
+    label: "hijau"
+    hsv_ranges:
+      - lower: [40, 80, 60]
+        upper: [85, 255, 255]
+    min_area_px: 500
+    confidence_threshold: 0.02
+
+  # Biru
+  blue:
+    label: "biru"
+    hsv_ranges:
+      - lower: [100, 80, 60]
+        upper: [135, 255, 255]
+    min_area_px: 500
+    confidence_threshold: 0.02
+
+detection:
+  consecutive_frames: 3       # konfirmasi setelah N frame berturut-turut
+  publish_rate_hz: 10.0       # rate publish hasil deteksi
+  camera_topic: /camera/image_raw
+
+shape_detection:
+  circularity_threshold: 0.75  # C = 4π×Area/Perimeter² > threshold = lingkaran
+  min_contour_area: 800
+  labels:
+    circle_red:   "O-merah"
+    circle_green: "O-hijau"
+
+# Parameter kamera (untuk camera_info)
+camera:
+  width: 640
+  height: 480
+  fps: 30

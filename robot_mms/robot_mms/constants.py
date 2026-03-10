@@ -236,3 +236,43 @@ BALANCE_APPROACH_SPEED_M_S: float = 0.05
 
 BALANCE_TIMEOUT_S: float = 8.0
 """Timeout balance — jika 8 detik tidak sampai, abort."""
+
+# =====================================================================
+# Computer Vision — ADDED(phase3-vision)
+# =====================================================================
+
+VISION_LABEL_RED: str = "merah"
+"""Label warna merah — sesuai kisi-kisi LKS."""
+
+VISION_LABEL_GREEN: str = "hijau"
+"""Label warna hijau — sesuai kisi-kisi LKS."""
+
+VISION_LABEL_BLUE: str = "biru"
+"""Label warna biru — sesuai kisi-kisi LKS."""
+
+VISION_LABEL_NONE: str = "none"
+"""Label default saat tidak ada warna terdeteksi."""
+
+# Shape+color labels (Modul D7-D8)
+VISION_LABEL_CIRCLE_RED: str = "O-merah"
+"""Label lingkaran merah — sesuai kisi-kisi LKS."""
+
+VISION_LABEL_CIRCLE_GREEN: str = "O-hijau"
+"""Label lingkaran hijau — sesuai kisi-kisi LKS."""
+
+# Label set valid untuk validasi output
+VISION_COLOR_LABELS: tuple = ("merah", "hijau", "biru", "none")
+"""Set label warna valid — untuk validasi output deteksi."""
+
+VISION_SHAPE_LABELS: tuple = ("O-merah", "O-hijau", "none")
+"""Set label bentuk+warna valid — untuk validasi output deteksi."""
+
+# Detection thresholds
+VISION_MIN_AREA_PX: int = 500
+"""Area minimum piksel untuk deteksi warna dianggap valid."""
+
+VISION_CONSECUTIVE_FRAMES: int = 3
+"""Jumlah frame berturut-turut untuk konfirmasi deteksi."""
+
+VISION_CIRCULARITY_THRESHOLD: float = 0.75
+"""Threshold circularity (4π×Area/Perimeter²) untuk deteksi lingkaran."""
