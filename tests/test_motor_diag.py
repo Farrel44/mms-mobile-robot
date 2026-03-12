@@ -24,7 +24,7 @@ import time
 # ---------------------------------------------------------------------------
 PACKET_HEADER = 0xA5
 CMD_SIZE = 8
-FEEDBACK_SIZE = 26
+FEEDBACK_SIZE = 42  # Updated: 26 (original) + 16 (8×uint16 ultrasonic)
 TICKS_PER_REV = 380.0
 
 

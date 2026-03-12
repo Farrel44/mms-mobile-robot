@@ -22,7 +22,7 @@ import time
 # Protokol serial (identik dengan firmware STM32 & ESP32)
 # ---------------------------------------------------------------------------
 PACKET_HEADER = 0xA5
-FEEDBACK_SIZE = 26  # header(1) + 3×int32(12) + 3×int16 gyro(6) + 3×int16 accel(6) + xor(1)
+FEEDBACK_SIZE = 42  # header(1) + ticks(12) + gyro(6) + accel(6) + ultrasonic(16) + xor(1)
 
 
 def xor_checksum(data: bytes) -> int:
@@ -33,7 +33,7 @@ def xor_checksum(data: bytes) -> int:
 
 
 def parse_feedback(packet: bytes):
-    """Parse 26-byte feedback → (t1, t2, t3, gx, gy, gz, ax, ay, az) or None."""
+    """Parse 42-byte feedback → (t1, t2, t3, gx, gy, gz, ax, ay, az) or None."""
     if len(packet) != FEEDBACK_SIZE:
         return None
     if packet[0] != PACKET_HEADER:

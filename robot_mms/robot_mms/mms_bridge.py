@@ -557,6 +557,10 @@ class MotorBridge(Node):
         vy = msg.linear.y
         wz = msg.angular.z
 
+        # DEBUG: log setiap cmd_vel yang diterima (INFO level)
+        self.get_logger().info(
+            f'CMD_VEL RX: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}')
+
         # Rec 2: Reject NaN/Inf — safety-critical guard
         if not (math.isfinite(vx) and math.isfinite(vy) and math.isfinite(wz)):
             self.get_logger().warn(
@@ -592,11 +596,14 @@ class MotorBridge(Node):
     def send_rpm_command(self, rpm1, rpm2, rpm3):
         """Kirim paket RPM ke STM32 (Rec 4: reconnect-safe)."""
         if not self.serial_connected or self.ser is None:
+            self.get_logger().warn(
+                f'RPM DROPPED (serial disconnected): '
+                f'M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
             return
         packet = self.build_command_packet(rpm1, rpm2, rpm3)
         try:
             self.ser.write(packet)
-            self.get_logger().debug(
+            self.get_logger().info(
                 f'TX RPM: M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
         except Exception as e:
             self._mark_serial_disconnected(e)
