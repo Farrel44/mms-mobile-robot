@@ -37,7 +37,7 @@ from .constants import (  # ADDED(phase2-ultrasonic)
 # Protokol serial (sesuai firmware STM32 — identik dengan ESP32)
 PACKET_HEADER = 0xA5
 CMD_PACKET_SIZE = 8       # header(1) + 3×int16(6) + xor(1)
-FEEDBACK_PACKET_SIZE = 42  # UPDATED(phase2-ultrasonic): 26 → 42 (added 16 bytes ultrasonic)
+FEEDBACK_PACKET_SIZE = 42  # feedback: encoder+IMU+ultrasonic+XOR
 
 
 class MotorBridge(Node):
@@ -495,10 +495,10 @@ class MotorBridge(Node):
         return packet + bytes([checksum])
 
     def parse_feedback_packet(self, packet):
-        """Parse feedback 26 byte dari STM32.
+        """Parse feedback 42 byte dari STM32.
 
         Format: [0xA5, T1(4), T2(4), T3(4), GX(2), GY(2), GZ(2),
-                 AX(2), AY(2), AZ(2), XOR]
+                 AX(2), AY(2), AZ(2), US0-7(16), XOR]
         STM32 mengirim milli-unit int16 (×1000) for gyro (rad/s)
         and accel (m/s²).
 
