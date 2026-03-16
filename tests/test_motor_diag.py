@@ -26,6 +26,8 @@ PACKET_HEADER = 0xA5
 CMD_SIZE = 8
 FEEDBACK_SIZE = 42  # Updated: 26 (original) + 16 (8×uint16 ultrasonic)
 TICKS_PER_REV = 380.0
+KEEPALIVE_INTERVAL_S = 0.05
+MAX_KEEPALIVE_GAP_S = 0.20
 
 
 def xor_checksum(data: bytes) -> int:
@@ -124,6 +126,92 @@ def read_feedback_for(ser, duration_s, send_rpm=None, cmd_interval=0.02):
                 results.append((time.monotonic() - t0,) + result)
 
     return results
+
+
+def _phase_for_elapsed(elapsed_s: float, phase_plan: list[tuple[str, int, float]]) -> tuple[str, int]:
+    """Map elapsed time to active phase label and RPM target.
+
+    Args:
+        elapsed_s: elapsed time from phase sequence start (seconds).
+        phase_plan: list of (label, rpm_target, duration_s)
+
+    Returns:
+        Tuple (label, rpm_target) for current elapsed time.
+    """
+    acc_s = 0.0
+    for label, rpm_target, dur_s in phase_plan:
+        acc_s += dur_s
+        if elapsed_s < acc_s:
+            return label, rpm_target
+    last_label, last_rpm, _ = phase_plan[-1]
+    return last_label, last_rpm
+
+
+def run_motor_drive_phases(
+    ser,
+    phase_plan: list[tuple[str, int, float]],
+    cmd_interval_s: float = KEEPALIVE_INTERVAL_S,
+):
+    """Run motor-drive phases with continuous keepalive and feedback capture.
+
+    Args:
+        ser: open serial handle.
+        phase_plan: list of (label, rpm_target, duration_s).
+        cmd_interval_s: interval command keepalive in seconds.
+
+    Returns:
+        Tuple:
+          - dict label -> list samples parsed in that phase.
+          - dict keepalive stats {'sent', 'max_gap_s', 'max_gap_ms'}.
+    """
+    samples_by_phase = {label: [] for label, _, _ in phase_plan}
+    total_duration_s = sum(dur_s for _, _, dur_s in phase_plan)
+
+    buf = bytearray()
+    t0 = time.monotonic()
+    t_last_cmd = time.monotonic() - cmd_interval_s
+    cmd_send_times: list[float] = []
+
+    while True:
+        t_now = time.monotonic()
+        elapsed_s = t_now - t0
+        if elapsed_s >= total_duration_s:
+            break
+
+        label, rpm_target = _phase_for_elapsed(elapsed_s, phase_plan)
+
+        if (t_now - t_last_cmd) >= cmd_interval_s:
+            ser.write(build_command(rpm_target, 0, 0))
+            cmd_send_times.append(t_now)
+            t_last_cmd = t_now
+
+        waiting = ser.in_waiting
+        if waiting > 0:
+            buf.extend(ser.read(waiting))
+        else:
+            buf.extend(ser.read(1))
+
+        for pkt in extract_packets(buf):
+            parsed = parse_feedback(pkt)
+            if parsed is None:
+                continue
+            sample_elapsed_s = time.monotonic() - t0
+            sample_label, _ = _phase_for_elapsed(sample_elapsed_s, phase_plan)
+            samples_by_phase[sample_label].append((sample_elapsed_s,) + parsed)
+
+    max_gap_s = 0.0
+    if len(cmd_send_times) >= 2:
+        for i in range(1, len(cmd_send_times)):
+            gap = cmd_send_times[i] - cmd_send_times[i - 1]
+            if gap > max_gap_s:
+                max_gap_s = gap
+
+    keepalive_stats = {
+        'sent': len(cmd_send_times),
+        'max_gap_s': max_gap_s,
+        'max_gap_ms': max_gap_s * 1000.0,
+    }
+    return samples_by_phase, keepalive_stats
 
 
 def send_stop(ser):
@@ -265,11 +353,23 @@ def main():
     motor_moved = False
     phase_results = {}
 
-    for rpm_target, label in [(100, 'A'), (300, 'B'), (500, 'C')]:
+    phase_plan = [
+        ('A', 100, 2.0),
+        ('B', 300, 2.0),
+        ('C', 500, 2.0),
+    ]
+
+    print('  Running A→B→C with CONTINUOUS keepalive at 50ms interval...')
+    all_phase_samples, keepalive_stats = run_motor_drive_phases(
+        ser,
+        phase_plan,
+        cmd_interval_s=KEEPALIVE_INTERVAL_S,
+    )
+
+    for label, rpm_target, _ in phase_plan:
         print(f'  Phase {label}: Sending RPM={rpm_target} to Motor 1...')
 
-        results = read_feedback_for(
-            ser, duration_s=2.0, send_rpm=[rpm_target, 0, 0])
+        results = all_phase_samples[label]
 
         # Analyze ticks from motor 1
         total_abs = 0
@@ -294,6 +394,14 @@ def main():
 
         if total_abs > 5:
             motor_moved = True
+
+    print()
+    print(f"  Keepalive packets sent: {keepalive_stats['sent']}")
+    print(f"  Max keepalive gap: {keepalive_stats['max_gap_ms']:.1f} ms")
+    if keepalive_stats['max_gap_s'] > MAX_KEEPALIVE_GAP_S:
+        print(f'  [WARN] Max gap > {int(MAX_KEEPALIVE_GAP_S * 1000)} ms (watchdog risk)')
+    else:
+        print(f'  [OK] Max gap <= {int(MAX_KEEPALIVE_GAP_S * 1000)} ms')
 
     print()
 
