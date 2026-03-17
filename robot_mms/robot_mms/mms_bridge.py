@@ -82,6 +82,11 @@ class MotorBridge(Node):
         self.last_wz = 0.0
         self.last_odom_stamp = None
 
+        # RPM terakhir yang dikirim (untuk watchdog decel)
+        self.last_rpm1 = 0
+        self.last_rpm2 = 0
+        self.last_rpm3 = 0
+
         # Odometry covariance accumulators (Rec 1)
         self.total_distance = 0.0   # meters traveled (monotonic)
         self.total_rotation = 0.0   # radians rotated (monotonic, absolute)
@@ -576,8 +581,9 @@ class MotorBridge(Node):
             f'cmd_vel: vx={vx:.3f} vy={vy:.3f} wz={wz:.3f}')
 
         # Inverse kinematics: cmd_vel -> kecepatan roda -> RPM
+        vx_ik = -vx  # align +vx (maju) ke rumus IK eksisting
         v1, v2, v3 = kinematics.cmd_vel_to_wheel_velocities(
-            vx, vy, wz, self.robot_radius)
+            vx_ik, vy, wz, self.robot_radius)
         rpm1 = kinematics.velocity_to_rpm(v1, self.wheel_radius)
         rpm2 = kinematics.velocity_to_rpm(v2, self.wheel_radius)
         rpm3 = kinematics.velocity_to_rpm(v3, self.wheel_radius)
@@ -595,16 +601,25 @@ class MotorBridge(Node):
 
     def send_rpm_command(self, rpm1, rpm2, rpm3):
         """Kirim paket RPM ke STM32 (Rec 4: reconnect-safe)."""
+        rpm1_int = int(max(min(rpm1, self.max_rpm), -self.max_rpm))
+        rpm2_int = int(max(min(rpm2, self.max_rpm), -self.max_rpm))
+        rpm3_int = int(max(min(rpm3, self.max_rpm), -self.max_rpm))
+
+        # Simpan sebagai state terakhir (untuk soft-stop watchdog)
+        self.last_rpm1 = rpm1_int
+        self.last_rpm2 = rpm2_int
+        self.last_rpm3 = rpm3_int
+
         if not self.serial_connected or self.ser is None:
             self.get_logger().warn(
                 f'RPM DROPPED (serial disconnected): '
-                f'M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
+                f'M1={rpm1_int} M2={rpm2_int} M3={rpm3_int}')
             return
-        packet = self.build_command_packet(rpm1, rpm2, rpm3)
+        packet = self.build_command_packet(rpm1_int, rpm2_int, rpm3_int)
         try:
             self.ser.write(packet)
             self.get_logger().info(
-                f'TX RPM: M1={int(rpm1)} M2={int(rpm2)} M3={int(rpm3)}')
+                f'TX RPM: M1={rpm1_int} M2={rpm2_int} M3={rpm3_int}')
         except Exception as e:
             self._mark_serial_disconnected(e)
 
@@ -1020,13 +1035,32 @@ class MotorBridge(Node):
     # Watchdog: stop motor kalau cmd_vel timeout
     # =================================================================
 
+    def _soft_stop(self):
+        """Ramping stop 300 ms (6×50 ms) pakai last RPM, lalu STOP."""
+        rpm1 = self.last_rpm1
+        rpm2 = self.last_rpm2
+        rpm3 = self.last_rpm3
+
+        for _ in range(6):
+            rpm1 = int(rpm1 * 0.5)
+            rpm2 = int(rpm2 * 0.5)
+            rpm3 = int(rpm3 * 0.5)
+
+            self.send_rpm_command(rpm1, rpm2, rpm3)
+
+            if all(abs(r) < 5 for r in (rpm1, rpm2, rpm3)):
+                break
+            time.sleep(0.05)
+
+        self.send_stop_command()
+
     def watchdog_callback(self):
         """Hentikan motor kalau tidak ada cmd_vel dalam batas waktu."""
         elapsed = (self.get_clock().now() - self.last_cmd_stamp).nanoseconds / 1e9
         if elapsed > self.watchdog_timeout and not self.watchdog_triggered:
             self.get_logger().warn(
                 f'WATCHDOG: cmd_vel timeout ({elapsed:.2f}s) -> motor stop')
-            self.send_stop_command()
+            self._soft_stop()
             self.watchdog_triggered = True
 
 
