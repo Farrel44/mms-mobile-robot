@@ -83,9 +83,9 @@ class MotorBridge(Node):
         self.last_odom_stamp = None
 
         # RPM terakhir yang dikirim (untuk watchdog decel)
-        self.last_rpm1 = 0
-        self.last_rpm2 = 0
-        self.last_rpm3 = 0
+        self._last_rpm1 = 0
+        self._last_rpm2 = 0
+        self._last_rpm3 = 0
 
         # Odometry covariance accumulators (Rec 1)
         self.total_distance = 0.0   # meters traveled (monotonic)
@@ -598,23 +598,32 @@ class MotorBridge(Node):
             f'Wheel vel: v1={v1:.3f} v2={v2:.3f} v3={v3:.3f} m/s')
 
         self.send_rpm_command(rpm1, rpm2, rpm3)
+        self._set_last_rpm(
+            int(max(min(rpm1, self.max_rpm), -self.max_rpm)),
+            int(max(min(rpm2, self.max_rpm), -self.max_rpm)),
+            int(max(min(rpm3, self.max_rpm), -self.max_rpm)),
+        )
 
-    def send_rpm_command(self, rpm1, rpm2, rpm3):
-        """Kirim paket RPM ke STM32 (Rec 4: reconnect-safe)."""
+    def _set_last_rpm(self, rpm1: int, rpm2: int, rpm3: int) -> None:
+        """Simpan RPM terakhir untuk profil stop yang konsisten."""
+        self._last_rpm1 = rpm1
+        self._last_rpm2 = rpm2
+        self._last_rpm3 = rpm3
+
+    def _send_rpm_packet(self, rpm1: float, rpm2: float, rpm3: float) -> None:
+        """Kirim paket RPM ke STM32 dan update state terakhir."""
         rpm1_int = int(max(min(rpm1, self.max_rpm), -self.max_rpm))
         rpm2_int = int(max(min(rpm2, self.max_rpm), -self.max_rpm))
         rpm3_int = int(max(min(rpm3, self.max_rpm), -self.max_rpm))
 
-        # Simpan sebagai state terakhir (untuk soft-stop watchdog)
-        self.last_rpm1 = rpm1_int
-        self.last_rpm2 = rpm2_int
-        self.last_rpm3 = rpm3_int
+        self._set_last_rpm(rpm1_int, rpm2_int, rpm3_int)
 
         if not self.serial_connected or self.ser is None:
             self.get_logger().warn(
                 f'RPM DROPPED (serial disconnected): '
                 f'M1={rpm1_int} M2={rpm2_int} M3={rpm3_int}')
             return
+
         packet = self.build_command_packet(rpm1_int, rpm2_int, rpm3_int)
         try:
             self.ser.write(packet)
@@ -623,9 +632,13 @@ class MotorBridge(Node):
         except Exception as e:
             self._mark_serial_disconnected(e)
 
-    def send_stop_command(self):
-        """Kirim RPM=0 ke semua motor."""
-        self.send_rpm_command(0, 0, 0)
+    def send_rpm_command(self, rpm1: float, rpm2: float, rpm3: float) -> None:
+        """Kirim paket RPM ke STM32 (Rec 4: reconnect-safe)."""
+        self._send_rpm_packet(rpm1, rpm2, rpm3)
+
+    def send_stop_command(self) -> None:
+        """Kirim perintah stop halus ke semua motor."""
+        self._smooth_stop()
         self.get_logger().warn('STOP dikirim!')
 
     # =================================================================
@@ -1035,24 +1048,20 @@ class MotorBridge(Node):
     # Watchdog: stop motor kalau cmd_vel timeout
     # =================================================================
 
-    def _soft_stop(self):
-        """Ramping stop 300 ms (6×50 ms) pakai last RPM, lalu STOP."""
-        rpm1 = self.last_rpm1
-        rpm2 = self.last_rpm2
-        rpm3 = self.last_rpm3
+    def _smooth_stop(self) -> None:
+        """Ramp motor RPM down smoothly using last commanded values."""
+        rpm1 = self._last_rpm1
+        rpm2 = self._last_rpm2
+        rpm3 = self._last_rpm3
 
-        for _ in range(6):
+        for _ in range(6):  # 6 × 50 ms = 300 ms ramp
             rpm1 = int(rpm1 * 0.5)
             rpm2 = int(rpm2 * 0.5)
             rpm3 = int(rpm3 * 0.5)
-
-            self.send_rpm_command(rpm1, rpm2, rpm3)
-
-            if all(abs(r) < 5 for r in (rpm1, rpm2, rpm3)):
-                break
+            self._send_rpm_packet(rpm1, rpm2, rpm3)
             time.sleep(0.05)
 
-        self.send_stop_command()
+        self._send_rpm_packet(0, 0, 0)
 
     def watchdog_callback(self):
         """Hentikan motor kalau tidak ada cmd_vel dalam batas waktu."""
@@ -1060,7 +1069,7 @@ class MotorBridge(Node):
         if elapsed > self.watchdog_timeout and not self.watchdog_triggered:
             self.get_logger().warn(
                 f'WATCHDOG: cmd_vel timeout ({elapsed:.2f}s) -> motor stop')
-            self._soft_stop()
+            self._smooth_stop()
             self.watchdog_triggered = True
 
 
